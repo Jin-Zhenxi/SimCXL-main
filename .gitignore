@@ -1,0 +1,92 @@
+build
+gem5_build
+parser.out
+parsetab.py
+cscope.files
+cscope.out
+*.pyc
+*~
+.*.swp
+.*.swo
+m5out
+/src/doxygen/html
+/ext/dramsim2/DRAMSim2
+/ext/mcpat/regression/*/*.out
+/util/m5/*.o
+/util/m5/*.a
+/util/m5/m5
+/util/packet_pb2.py
+/util/tap/*.d
+/util/tap/*.o
+/util/tap/m5tap
+/util/term/m5term
+/system/arm/dt/*.dtb
+/system/arm/dt/.gen
+/system/arm/bootloader/arm/*.o
+/system/arm/bootloader/arm/boot.arm
+/system/arm/bootloader/arm/boot_emm.arm
+/system/arm/bootloader/arm64/*.o
+/system/arm/bootloader/arm64/boot.arm64
+/system/arm/bootloader/arm64/boot_emm.arm64
+/system/arm/bootloader/arm64/boot_v2.arm64
+configs/example/memcheck.cfg
+configs/dram/lowp_sweep.cfg
+.pyenv
+.vscode
+/fs_result
+/full-system-image
+Doxygen.config
+/include/cxl_kvs/viper/build
+/accel_result
+typings
+include/cxl_benchmark/lmbench3
+/output
+
+# === gem5 & CXL 仿真专属忽略规则 ===
+
+# 1. 忽略所有编译产物和临时文件
+build/
+*.o
+*.a
+*.so
+*.pyc
+__pycache__/
+
+# 2. 忽略庞大的磁盘镜像
+*.img
+*.iso
+*.disk
+
+# 3. 忽略 Python 虚拟环境
+gem5-venv/
+venv/
+.env/
+
+# 4. 忽略我们脚本生成的仿真输出数据和日志
+my_outputData/*
+!my_outputData/*.csv
+m5out*/
+*.txt
+*.csv
+!roofline_data.csv
+
+# 4.1 屏蔽 gem5 运行时的全量冗余日志 (这些通常很大且没必要上传)
+**/stats.txt
+**/config.ini
+**/config.json
+**/terminal_log*.txt
+
+# 4.2 屏蔽 gem5 产生的庞大调试信息
+m5out/
+
+# 5. 忽略你自己编译的 C 语言二进制执行文件
+trigger_gemm
+trigger_pcie
+
+# 6. 编辑器缓存
+.vscode/
+.idea/
+.cursor/
+
+# 7. 屏蔽 Windows 带来的 Zone.Identifier 影子文件 (需 **/* 才能匹配子目录)
+**/*:Zone.Identifier
