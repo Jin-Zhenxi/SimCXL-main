@@ -44,7 +44,11 @@ import argparse
 import m5
 from gem5.utils.requires import requires
 from gem5.components.boards.x86_board import X86Board
-from gem5.components.memory.single_channel import DIMM_DDR5_4400, SingleChannelDDR4_3200
+from gem5.components.memory.single_channel import (
+    DIMM_DDR5_4400,
+    DIMM_DDR5_8400,
+    SingleChannelDDR4_3200,
+)
 from gem5.components.processors.simple_switchable_processor import SimpleSwitchableProcessor
 from gem5.components.processors.cpu_types import CPUTypes
 from gem5.components.cachehierarchies.classic.private_l1_private_l2_shared_l3_cache_hierarchy import (
@@ -89,6 +93,7 @@ if args.no_network:
     os.environ["GEM5_USE_ETHERtap_STUB"] = "1"
 
 # Setup Classic MESI Three Level Cache Hierarchy
+# 64 GB/s 全链路：L2 mshrs=64（折中值，比 20 强、比 128 稳）
 cache_hierarchy = PrivateL1PrivateL2SharedL3CacheHierarchy(
     l1d_size="48kB",
     l1d_assoc=6,
@@ -98,11 +103,13 @@ cache_hierarchy = PrivateL1PrivateL2SharedL3CacheHierarchy(
     l2_assoc=16,
     l3_size="96MB",
     l3_assoc=48,
+    l2_mshrs=64,
 )
 
 # Setup system memory and CXL memory
+# 64 GB/s 对比：CXL 内存改用 DDR5-8400（67.2 GB/s），原 4400 约 35 GB/s
 memory = DIMM_DDR5_4400(size="3GB")
-cxl_dram = DIMM_DDR5_4400(size="8GB")
+cxl_dram = DIMM_DDR5_8400(size="8GB")
 if args.is_asic == 'False':
     cxl_dram = SingleChannelDDR4_3200(size="8GB")
 

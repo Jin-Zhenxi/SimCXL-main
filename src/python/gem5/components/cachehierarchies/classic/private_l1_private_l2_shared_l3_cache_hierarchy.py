@@ -82,6 +82,8 @@ class PrivateL1PrivateL2SharedL3CacheHierarchy(
         l1i_assoc: int = 8,
         l2_assoc: int = 16,
         l3_assoc: int = 16,
+        l2_mshrs: int = 20,
+        l3_mshrs: int = 384,
         membus: BaseXBar = _get_default_membus.__func__(),
     ) -> None:
         """
@@ -93,11 +95,15 @@ class PrivateL1PrivateL2SharedL3CacheHierarchy(
         :param l1i_assoc: The associativity of the L1 Instruction Cache.
         :param l2_assoc: The associativity of the L2 Cache.
         :param l3_assoc: The associativity of the L3 Cache.
+        :param l2_mshrs: MSHRs for L2 (default 20). Increase for high-BW CXL.
+        :param l3_mshrs: MSHRs for L3 (default 384).
         :param membus: The memory bus. This parameter is optional parameter and
                        will default to a 64 bit width SystemXBar is not specified.
         """
 
         AbstractClassicCacheHierarchy.__init__(self=self)
+        self._l2_mshrs = l2_mshrs
+        self._l3_mshrs = l3_mshrs
         AbstractThreeLevelCacheHierarchy.__init__(
             self,
             l1i_size=l1i_size,
@@ -144,11 +150,13 @@ class PrivateL1PrivateL2SharedL3CacheHierarchy(
             L2XBar() for i in range(board.get_processor().get_num_cores())
         ]
         self.l2caches = [
-            L2Cache(size=self._l2_size)
+            L2Cache(size=self._l2_size, mshrs=self._l2_mshrs)
             for i in range(board.get_processor().get_num_cores())
         ]
         self.l3bus = L3XBar()
-        self.l3cache = L3Cache(size=self._l3_size, assoc=self._l3_assoc)
+        self.l3cache = L3Cache(
+            size=self._l3_size, assoc=self._l3_assoc, mshrs=self._l3_mshrs
+        )
         # ITLB Page walk caches
         self.iptw_caches = [
             MMUCache(size="256KiB", writeback_clean=False)

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string>
 
 #include "base/logging.hh"
 #include "base/trace.hh"
@@ -19,12 +20,6 @@ divCeil(uint64_t a, uint64_t b)
     return (a + b - 1) / b;
 }
 
-inline Addr
-alignUp(Addr value, Addr align)
-{
-    return align == 0 ? value : ((value + align - 1) / align) * align;
-}
-
 } // namespace
 
 MatrixFlowEngine::MatrixFlowEngine(const Params &p)
@@ -33,9 +28,9 @@ MatrixFlowEngine::MatrixFlowEngine(const Params &p)
       macArraySize(p.mac_array_size),
       computeLatencyPerOp(p.compute_latency_per_op),
       phase(Phase::Idle),
-      tileABuffer(32 * 32 * sizeof(uint32_t), 0),
-      tileBBuffer(32 * 32 * sizeof(uint32_t), 0),
-      tileCBuffer(32 * 32 * sizeof(uint32_t), 0),
+      tileABuffer(kMaxTileDim * kMaxTileDim * sizeof(uint32_t), 0),
+      tileBBuffer(kMaxTileDim * kMaxTileDim * sizeof(uint32_t), 0),
+      tileCBuffer(kMaxTileDim * kMaxTileDim * sizeof(uint32_t), 0),
       computeBusy(false),
       pendingDescAddr(0),
       pendingMatrixA(0),
@@ -47,19 +42,32 @@ MatrixFlowEngine::MatrixFlowEngine(const Params &p)
       completionFlagValue(1),
       fetchDescCompleteEvent(
           [this] { onFetchDescComplete(); }, name() + ".fetch_desc"),
-      fetchACompleteEvent([this] { onFetchAComplete(); }, name() + ".fetch_a"),
-      fetchBCompleteEvent([this] { onFetchBComplete(); }, name() + ".fetch_b"),
       computeDoneEvent([this] { processComputeDone(); }, name() + ".compute"),
-      writeCCompleteEvent([this] { onWriteCComplete(); }, name() + ".write_c"),
       writeFlagCompleteEvent(
           [this] { onWriteFlagComplete(); }, name() + ".write_flag"),
       stats(this)
 {
+    fetchARowEvents.reserve(kMaxTileDim);
+    fetchBRowEvents.reserve(kMaxTileDim);
+    writeCRowEvents.reserve(kMaxTileDim);
+    for (int i = 0; i < kMaxTileDim; ++i) {
+        fetchARowEvents.emplace_back(
+            [this] { onFetchARowComplete(); },
+            name() + ".fetchA_row" + std::to_string(i));
+        fetchBRowEvents.emplace_back(
+            [this] { onFetchBRowComplete(); },
+            name() + ".fetchB_row" + std::to_string(i));
+        writeCRowEvents.emplace_back(
+            [this] { onWriteCRowComplete(); },
+            name() + ".writeC_row" + std::to_string(i));
+    }
+
     DPRINTF(MatrixFlow,
             "Create MatrixFlowEngine: mac_array_size=%u, "
-            "compute_latency_per_op=%llu cycles\n",
+            "compute_latency_per_op=%llu cycles, maxTile=%d\n",
             macArraySize,
-            static_cast<unsigned long long>(computeLatencyPerOp));
+            static_cast<unsigned long long>(computeLatencyPerOp),
+            kMaxTileDim);
 }
 
 MatrixFlowEngine::EngineStats::EngineStats(statistics::Group *parent)
@@ -132,6 +140,9 @@ MatrixFlowEngine::resetContext()
     pendingSize = 0;
     pendingDesc = Descriptor();
     completionFlagValue = 1;
+    reqsIssuedA = reqsCompletedA = targetReqsA = 0;
+    reqsIssuedB = reqsCompletedB = targetReqsB = 0;
+    reqsIssuedC = reqsCompletedC = targetReqsC = 0;
 }
 
 void
@@ -165,9 +176,10 @@ MatrixFlowEngine::onFetchDescComplete()
     ctx.flagAddr = pendingDesc.flagAddr;
     ctx.size = pendingDesc.size;
     ctx.elemBytes = sizeof(uint32_t);
-    ctx.tileM = std::min<uint32_t>(32, ctx.size);
-    ctx.tileN = std::min<uint32_t>(32, ctx.size);
-    ctx.tileK = std::min<uint32_t>(32, ctx.size);
+    const uint32_t cap = static_cast<uint32_t>(kMaxTileDim);
+    ctx.tileM = std::min(cap, ctx.size);
+    ctx.tileN = std::min(cap, ctx.size);
+    ctx.tileK = std::min(cap, ctx.size);
     ctx.i = 0;
     ctx.j = 0;
     ctx.k = 0;
@@ -197,7 +209,6 @@ MatrixFlowEngine::prepareOutputTile()
     ctx.curTileM = std::min(ctx.tileM, ctx.size - ctx.i);
     ctx.curTileN = std::min(ctx.tileN, ctx.size - ctx.j);
     ctx.curTileK = std::min(ctx.tileK, ctx.size - ctx.k);
-    ctx.dmaRow = 0;
 
     if (ctx.k == 0) {
         std::fill(tileCBuffer.begin(), tileCBuffer.end(), 0);
@@ -209,25 +220,46 @@ MatrixFlowEngine::issueFetchATile()
 {
     phase = Phase::FetchA;
 
-    if (ctx.dmaRow >= ctx.curTileM) {
+    panic_if(ctx.curTileM > static_cast<uint32_t>(kMaxTileDim),
+             "%s: curTileM=%u exceeds max %d\n", name(), ctx.curTileM,
+             kMaxTileDim);
+
+    if (ctx.curTileM == 0) {
         issueFetchBTile();
         return;
     }
 
-    const Addr rowAddr = ctx.baseA +
-        ((static_cast<Addr>(ctx.i + ctx.dmaRow) * ctx.size + ctx.k) *
-         ctx.elemBytes);
-    const Addr rowBytes = static_cast<Addr>(ctx.curTileK) * ctx.elemBytes;
-    auto *dst = tileABuffer.data() + ctx.dmaRow * rowBytes;
+    reqsIssuedA = 0;
+    reqsCompletedA = 0;
+    targetReqsA = ctx.curTileM;
+    trySendMoreA();
+}
 
-    DPRINTF(MatrixFlow,
-            "DMA FetchA row=%u addr=%#llx bytes=%llu (tile i=%u j=%u k=%u)\n",
-            ctx.dmaRow, static_cast<unsigned long long>(rowAddr),
-            static_cast<unsigned long long>(rowBytes), ctx.i, ctx.j, ctx.k);
+void
+MatrixFlowEngine::trySendMoreA()
+{
+    const Addr rowBytes =
+        static_cast<Addr>(ctx.curTileK) * ctx.elemBytes;
 
-    stats.totalDmaBytesRead += rowBytes;
-    dmaPort.dmaAction(
-        MemCmd::ReadReq, rowAddr, rowBytes, &fetchACompleteEvent, dst, 0);
+    while (reqsIssuedA < targetReqsA &&
+           (reqsIssuedA - reqsCompletedA) < kMaxInFlight) {
+        const uint32_t r = reqsIssuedA;
+        const Addr rowAddr = ctx.baseA +
+            ((static_cast<Addr>(ctx.i + r) * ctx.size + ctx.k) *
+             ctx.elemBytes);
+        auto *dst = tileABuffer.data() + r * rowBytes;
+
+        DPRINTF(MatrixFlow,
+                "DMA FetchA row=%u addr=%#llx bytes=%llu (tile i=%u j=%u k=%u)\n",
+                r, static_cast<unsigned long long>(rowAddr),
+                static_cast<unsigned long long>(rowBytes), ctx.i, ctx.j,
+                ctx.k);
+
+        stats.totalDmaBytesRead += rowBytes;
+        dmaPort.dmaAction(MemCmd::ReadReq, rowAddr, rowBytes,
+                          &fetchARowEvents[r], dst, 0);
+        ++reqsIssuedA;
+    }
 }
 
 void
@@ -235,25 +267,46 @@ MatrixFlowEngine::issueFetchBTile()
 {
     phase = Phase::FetchB;
 
-    if (ctx.dmaRow >= ctx.curTileK) {
+    panic_if(ctx.curTileK > static_cast<uint32_t>(kMaxTileDim),
+             "%s: curTileK=%u exceeds max %d\n", name(), ctx.curTileK,
+             kMaxTileDim);
+
+    if (ctx.curTileK == 0) {
         launchComputeTile();
         return;
     }
 
-    const Addr rowAddr = ctx.baseB +
-        ((static_cast<Addr>(ctx.k + ctx.dmaRow) * ctx.size + ctx.j) *
-         ctx.elemBytes);
-    const Addr rowBytes = static_cast<Addr>(ctx.curTileN) * ctx.elemBytes;
-    auto *dst = tileBBuffer.data() + ctx.dmaRow * rowBytes;
+    reqsIssuedB = 0;
+    reqsCompletedB = 0;
+    targetReqsB = ctx.curTileK;
+    trySendMoreB();
+}
 
-    DPRINTF(MatrixFlow,
-            "DMA FetchB row=%u addr=%#llx bytes=%llu (tile i=%u j=%u k=%u)\n",
-            ctx.dmaRow, static_cast<unsigned long long>(rowAddr),
-            static_cast<unsigned long long>(rowBytes), ctx.i, ctx.j, ctx.k);
+void
+MatrixFlowEngine::trySendMoreB()
+{
+    const Addr rowBytes =
+        static_cast<Addr>(ctx.curTileN) * ctx.elemBytes;
 
-    stats.totalDmaBytesRead += rowBytes;
-    dmaPort.dmaAction(
-        MemCmd::ReadReq, rowAddr, rowBytes, &fetchBCompleteEvent, dst, 0);
+    while (reqsIssuedB < targetReqsB &&
+           (reqsIssuedB - reqsCompletedB) < kMaxInFlight) {
+        const uint32_t r = reqsIssuedB;
+        const Addr rowAddr = ctx.baseB +
+            ((static_cast<Addr>(ctx.k + r) * ctx.size + ctx.j) *
+             ctx.elemBytes);
+        auto *dst = tileBBuffer.data() + r * rowBytes;
+
+        DPRINTF(MatrixFlow,
+                "DMA FetchB row=%u addr=%#llx bytes=%llu (tile i=%u j=%u k=%u)\n",
+                r, static_cast<unsigned long long>(rowAddr),
+                static_cast<unsigned long long>(rowBytes), ctx.i, ctx.j,
+                ctx.k);
+
+        stats.totalDmaBytesRead += rowBytes;
+        dmaPort.dmaAction(MemCmd::ReadReq, rowAddr, rowBytes,
+                          &fetchBRowEvents[r], dst, 0);
+        ++reqsIssuedB;
+    }
 }
 
 void
@@ -261,25 +314,46 @@ MatrixFlowEngine::issueWriteCTile()
 {
     phase = Phase::WriteC;
 
-    if (ctx.dmaRow >= ctx.curTileM) {
+    panic_if(ctx.curTileM > static_cast<uint32_t>(kMaxTileDim),
+             "%s: issueWriteC curTileM=%u exceeds max %d\n", name(),
+             ctx.curTileM, kMaxTileDim);
+
+    if (ctx.curTileM == 0) {
         advanceTile();
         return;
     }
 
-    const Addr rowAddr = ctx.baseC +
-        ((static_cast<Addr>(ctx.i + ctx.dmaRow) * ctx.size + ctx.j) *
-         ctx.elemBytes);
-    const Addr rowBytes = static_cast<Addr>(ctx.curTileN) * ctx.elemBytes;
-    auto *src = tileCBuffer.data() + ctx.dmaRow * rowBytes;
+    reqsIssuedC = 0;
+    reqsCompletedC = 0;
+    targetReqsC = ctx.curTileM;
+    trySendMoreC();
+}
 
-    DPRINTF(MatrixFlow,
-            "DMA WriteC row=%u addr=%#llx bytes=%llu (tile i=%u j=%u k=%u)\n",
-            ctx.dmaRow, static_cast<unsigned long long>(rowAddr),
-            static_cast<unsigned long long>(rowBytes), ctx.i, ctx.j, ctx.k);
+void
+MatrixFlowEngine::trySendMoreC()
+{
+    const Addr rowBytes =
+        static_cast<Addr>(ctx.curTileN) * ctx.elemBytes;
 
-    stats.totalDmaBytesWritten += rowBytes;
-    dmaPort.dmaAction(
-        MemCmd::WriteReq, rowAddr, rowBytes, &writeCCompleteEvent, src, 0);
+    while (reqsIssuedC < targetReqsC &&
+           (reqsIssuedC - reqsCompletedC) < kMaxInFlight) {
+        const uint32_t r = reqsIssuedC;
+        const Addr rowAddr = ctx.baseC +
+            ((static_cast<Addr>(ctx.i + r) * ctx.size + ctx.j) *
+             ctx.elemBytes);
+        auto *src = tileCBuffer.data() + r * rowBytes;
+
+        DPRINTF(MatrixFlow,
+                "DMA WriteC row=%u addr=%#llx bytes=%llu (tile i=%u j=%u k=%u)\n",
+                r, static_cast<unsigned long long>(rowAddr),
+                static_cast<unsigned long long>(rowBytes), ctx.i, ctx.j,
+                ctx.k);
+
+        stats.totalDmaBytesWritten += rowBytes;
+        dmaPort.dmaAction(MemCmd::WriteReq, rowAddr, rowBytes,
+                          &writeCRowEvents[r], src, 0);
+        ++reqsIssuedC;
+    }
 }
 
 void
@@ -300,24 +374,45 @@ MatrixFlowEngine::issueWriteFlag()
 }
 
 void
-MatrixFlowEngine::onFetchAComplete()
+MatrixFlowEngine::onFetchARowComplete()
 {
-    ++ctx.dmaRow;
-    issueFetchATile();
+    panic_if(reqsCompletedA >= targetReqsA,
+             "%s: onFetchARowComplete reqsCompletedA=%u >= targetReqsA=%u\n",
+             name(), reqsCompletedA, targetReqsA);
+    ++reqsCompletedA;
+    if (reqsCompletedA == targetReqsA) {
+        issueFetchBTile();
+    } else {
+        trySendMoreA();
+    }
 }
 
 void
-MatrixFlowEngine::onFetchBComplete()
+MatrixFlowEngine::onFetchBRowComplete()
 {
-    ++ctx.dmaRow;
-    issueFetchBTile();
+    panic_if(reqsCompletedB >= targetReqsB,
+             "%s: onFetchBRowComplete reqsCompletedB=%u >= targetReqsB=%u\n",
+             name(), reqsCompletedB, targetReqsB);
+    ++reqsCompletedB;
+    if (reqsCompletedB == targetReqsB) {
+        launchComputeTile();
+    } else {
+        trySendMoreB();
+    }
 }
 
 void
-MatrixFlowEngine::onWriteCComplete()
+MatrixFlowEngine::onWriteCRowComplete()
 {
-    ++ctx.dmaRow;
-    issueWriteCTile();
+    panic_if(reqsCompletedC >= targetReqsC,
+             "%s: onWriteCRowComplete reqsCompletedC=%u >= targetReqsC=%u\n",
+             name(), reqsCompletedC, targetReqsC);
+    ++reqsCompletedC;
+    if (reqsCompletedC == targetReqsC) {
+        advanceTile();
+    } else {
+        trySendMoreC();
+    }
 }
 
 void
@@ -350,10 +445,10 @@ MatrixFlowEngine::accumulateCurrentTile()
     for (uint32_t m = 0; m < ctx.curTileM; ++m) {
         for (uint32_t n = 0; n < ctx.curTileN; ++n) {
             uint64_t acc = tileC[m * ctx.curTileN + n];
-            for (uint32_t k = 0; k < ctx.curTileK; ++k) {
+            for (uint32_t kk = 0; kk < ctx.curTileK; ++kk) {
                 acc += static_cast<uint64_t>(
-                    tileA[m * ctx.curTileK + k]) *
-                    static_cast<uint64_t>(tileB[k * ctx.curTileN + n]);
+                    tileA[m * ctx.curTileK + kk]) *
+                    static_cast<uint64_t>(tileB[kk * ctx.curTileN + n]);
             }
             tileC[m * ctx.curTileN + n] = static_cast<uint32_t>(acc);
         }
@@ -428,7 +523,6 @@ MatrixFlowEngine::processComputeDone()
         return;
     }
 
-    ctx.dmaRow = 0;
     issueWriteCTile();
 }
 

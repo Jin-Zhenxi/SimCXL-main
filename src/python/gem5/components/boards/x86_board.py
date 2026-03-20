@@ -144,8 +144,9 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             cxl_abstract_mems.append(mc.dram)
         self.memories.extend(cxl_abstract_mems)
 
+        # ASIC: dev_proto_lat=15ns, dev_req/rsp_fifo=128 (防高并发背压)
         if self._is_asic:
-            cxl_mem_ctrl.configCXL(Latency("15ns"), 48)
+            cxl_mem_ctrl.configCXL(Latency("15ns"), 128)
         else:
             cxl_mem_ctrl.configCXL(Latency("60ns"), 36)
 
@@ -180,8 +181,9 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
                 AddrRange(pci_config_address_space_base, Addr.max),
             ]
 
+            # 64 GB/s 全链路：width=32 支撑 >64 GB/s 理论带宽 (32*2.4GHz=76.8 GB/s)
             self.cxl_xbar = NoncoherentXBar(
-                width=16,
+                width=32,
                 frontend_latency=2,
                 forward_latency=1,
                 response_latency=2,

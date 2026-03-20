@@ -17,6 +17,11 @@ namespace gem5
 class MatrixFlowEngine : public ClockedObject
 {
   private:
+    /** Max tile dimension; buffer size and concurrent row DMA event pool. */
+    static constexpr int kMaxTileDim = 128;
+    /** Max in-flight DMA requests (sliding window to avoid bus deadlock). */
+    static constexpr uint32_t kMaxInFlight = 32;
+
     class EngineDmaPort : public DmaPort
     {
       public:
@@ -64,16 +69,15 @@ class MatrixFlowEngine : public ClockedObject
         Addr flagAddr = 0;
         uint32_t size = 0;
         uint32_t elemBytes = sizeof(uint32_t);
-        uint32_t tileM = 32;
-        uint32_t tileN = 32;
-        uint32_t tileK = 32;
+        uint32_t tileM = kMaxTileDim;
+        uint32_t tileN = kMaxTileDim;
+        uint32_t tileK = kMaxTileDim;
         uint32_t i = 0;
         uint32_t j = 0;
         uint32_t k = 0;
         uint32_t curTileM = 0;
         uint32_t curTileN = 0;
         uint32_t curTileK = 0;
-        uint32_t dmaRow = 0;
     };
 
     struct EngineStats : public statistics::Group
@@ -91,6 +95,7 @@ class MatrixFlowEngine : public ClockedObject
     Phase phase;
     GemmContext ctx;
 
+    /** Tile buffers: up to kMaxTileDim^2 uint32_t elements each. */
     std::vector<uint8_t> tileABuffer;
     std::vector<uint8_t> tileBBuffer;
     std::vector<uint8_t> tileCBuffer;
@@ -105,12 +110,25 @@ class MatrixFlowEngine : public ClockedObject
     Descriptor pendingDesc;
     uint64_t completionFlagValue;
 
+    /** Sliding window state: issued vs completed per phase. */
+    uint32_t reqsIssuedA = 0;
+    uint32_t reqsCompletedA = 0;
+    uint32_t targetReqsA = 0;
+    uint32_t reqsIssuedB = 0;
+    uint32_t reqsCompletedB = 0;
+    uint32_t targetReqsB = 0;
+    uint32_t reqsIssuedC = 0;
+    uint32_t reqsCompletedC = 0;
+    uint32_t targetReqsC = 0;
+
     EventFunctionWrapper fetchDescCompleteEvent;
-    EventFunctionWrapper fetchACompleteEvent;
-    EventFunctionWrapper fetchBCompleteEvent;
     EventFunctionWrapper computeDoneEvent;
-    EventFunctionWrapper writeCCompleteEvent;
     EventFunctionWrapper writeFlagCompleteEvent;
+
+    /** One completion event per row slot (avoids "Event already scheduled"). */
+    std::vector<EventFunctionWrapper> fetchARowEvents;
+    std::vector<EventFunctionWrapper> fetchBRowEvents;
+    std::vector<EventFunctionWrapper> writeCRowEvents;
 
     EngineStats stats;
 
@@ -122,11 +140,14 @@ class MatrixFlowEngine : public ClockedObject
     void issueFetchATile();
     void issueFetchBTile();
     void issueWriteCTile();
+    void trySendMoreA();
+    void trySendMoreB();
+    void trySendMoreC();
     void issueWriteFlag();
     void onFetchDescComplete();
-    void onFetchAComplete();
-    void onFetchBComplete();
-    void onWriteCComplete();
+    void onFetchARowComplete();
+    void onFetchBRowComplete();
+    void onWriteCRowComplete();
     void onWriteFlagComplete();
     void launchComputeTile();
     void accumulateCurrentTile();
