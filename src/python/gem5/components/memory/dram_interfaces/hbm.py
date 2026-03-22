@@ -279,3 +279,31 @@ class HBM_2000_4H_1x64(DRAMInterface):
     write_buffer_size = 64
 
     two_cycle_activate = True
+
+
+class Ideal_CXL_HBM2(HBM_1000_4H_1x128):
+    """
+    Idealized per-logical-channel HBM-style interface for CXL HDM (SimCXL).
+    Faster tCK than HBM_1000_4H_1x128; use with
+    ``ChanneledMemory(Ideal_CXL_HBM2, num_channels, 64, size=...)``.
+
+    Kept in **hbm.py** (not a separate submodule) so
+    ``from gem5.components.memory.dram_interfaces.hbm import Ideal_CXL_HBM2``
+    always resolves like other DRAM interfaces—avoids ModuleNotFoundError when
+    new .py files are missing from the runtime tree.
+    """
+
+    # The PCIe-HBM baseline models eight 1GiB logical channels for a total
+    # device capacity of 8GiB, so override the inherited 128MiB channel size.
+    device_size = "1GiB"
+
+    tCK = "1ns"
+    tBURST = "2ns"
+
+    tRP = "14ns"
+    tRCD = "14ns"
+    tCL = "14ns"
+    tRAS = "33ns"
+
+    read_buffer_size = 128
+    write_buffer_size = 128

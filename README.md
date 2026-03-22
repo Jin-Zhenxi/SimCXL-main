@@ -135,6 +135,46 @@ Notes:
 ## Roadmap
 <img src="doc/Roadmap.svg" alt="Roadmap" width="800" />
 
+## Frozen PCIe-HBM Upper-Bound Baseline
+
+This repository also contains an idealized PCIe-HBM upper-bound baseline used
+for end-to-end comparison against the CXL-PNM path. This baseline is not a
+full-model ViT runtime. It is a ViT-inspired / transformer-core proxy
+workload.
+
+Key parameters of the frozen baseline:
+
+- Topology: PCIe + device-side HBM baseline
+- Host-device link: 64 GB/s
+- Packetization model: zero small-packet penalty
+- `small_pkt_overhead_pct = 0`
+- Phase 2 data movement: explicit `devm-copy`
+- Phase 2 execution: host-side Non-GEMM proxy
+- Workload form: ViT-like layer proxy, not full-model ViT
+- MatrixFlow array: 16x16
+- Simulated clock: 2.4 GHz
+- Device memory: 8-channel idealized HBM (`Ideal_CXL_HBM2`)
+- ViT-like presets:
+  - Base-like: `S=197, H=768, M=3072, heads=12`
+  - Large-like: `S=257, H=1024, M=4096, heads=16`
+  - Huge-like: `S=257, H=1280, M=5120, heads=16`
+
+Implementation entry points:
+
+- Baseline config:
+  [configs/example/gem5_library/x86-cxl-pcie-hbm-autofallback.py](configs/example/gem5_library/x86-cxl-pcie-hbm-autofallback.py)
+- Board / link model:
+  [src/python/gem5/components/boards/x86_board.py](src/python/gem5/components/boards/x86_board.py)
+- Bridge packetization model:
+  [src/mem/Bridge.py](src/mem/Bridge.py)
+  [src/mem/cxl_bridge.cc](src/mem/cxl_bridge.cc)
+- Proxy workload:
+  [trigger_gemm.c](trigger_gemm.c)
+  [run_sweep.py](run_sweep.py)
+
+Result snapshots should be preserved before switching back to the CXL branch so
+the baseline definition does not drift across branches.
+
 ## Citation
 If you find SimCXL useful for your own work, please cite our papers as follows.
 ```tex

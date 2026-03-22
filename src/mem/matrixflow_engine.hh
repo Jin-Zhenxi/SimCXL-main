@@ -90,6 +90,7 @@ class MatrixFlowEngine : public ClockedObject
     };
 
     const unsigned macArraySize;
+    const unsigned dmaChunkSize;
     const Cycles computeLatencyPerOp;
 
     Phase phase;

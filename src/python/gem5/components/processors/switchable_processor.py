@@ -34,9 +34,11 @@ import m5
 
 from ...utils.override import *
 from ..boards.abstract_board import AbstractBoard
+from ..boards.mem_mode import MemMode
 from .abstract_core import AbstractCore
 from .abstract_processor import AbstractProcessor
 from .cpu_types import CPUTypes
+from .cpu_types import get_mem_mode
 from .simple_core import SimpleCore
 
 
@@ -152,6 +154,19 @@ class SwitchableProcessor(AbstractProcessor):
         m5.switchCpus(
             self._board, list(zip(current_core_simobj, to_switch_simobj))
         )
+
+        # Keep the board memory mode consistent with the active CPU model.
+        # Without this, a KVM->TIMING switch can leave the system stuck in
+        # atomic_noncaching mode, which invalidates timing-memory studies.
+        first_core = to_switch[0]
+        if isinstance(first_core, SimpleCore):
+            target_mem_mode = get_mem_mode(first_core.get_type())
+            if target_mem_mode == MemMode.ATOMIC:
+                self._board.set_mem_mode(MemMode.ATOMIC)
+            elif target_mem_mode == MemMode.ATOMIC_NONCACHING:
+                self._board.set_mem_mode(MemMode.ATOMIC_NONCACHING)
+            else:
+                self._board.set_mem_mode(MemMode.TIMING)
 
         # Ensure the current processor is updated.
         self._current_cores = to_switch

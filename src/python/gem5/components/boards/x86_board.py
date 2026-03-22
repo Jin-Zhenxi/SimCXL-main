@@ -44,6 +44,7 @@ from m5.objects import (
     Pc,
     Port,
     RawDiskImage,
+    SrcClockDomain,
     X86E820Entry,
     X86FsLinux,
     X86IntelMPBus,
@@ -144,7 +145,7 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             cxl_abstract_mems.append(mc.dram)
         self.memories.extend(cxl_abstract_mems)
 
-        # ASIC: dev_proto_lat=15ns, dev_req/rsp_fifo=128 (防高并发背压)
+        # ASIC：设备协议延迟按硅侧常见值；Phase2 CPU 经 CXLBridge 承受真实链路惩罚
         if self._is_asic:
             cxl_mem_ctrl.configCXL(Latency("15ns"), 128)
         else:
@@ -181,20 +182,36 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
                 AddrRange(pci_config_address_space_base, Addr.max),
             ]
 
-            # 64 GB/s 全链路：width=32 支撑 >64 GB/s 理论带宽 (32*2.4GHz=76.8 GB/s)
+            # Model a 64 GB/s host-device link with a dedicated 2 GHz fabric
+            # clock and a 32 B datapath (32 B * 2 GHz = 64 GB/s).
+            self.pcie_fabric_clk_domain = SrcClockDomain()
+            self.pcie_fabric_clk_domain.clock = "2GHz"
+            self.pcie_fabric_clk_domain.voltage_domain = (
+                self.clk_domain.voltage_domain
+            )
+
+            # XBar：保持 1 cycle（本地 fabric 极薄）；CXLBridge：恢复长链路延迟供 CPU 访存吃满惩罚
             self.cxl_xbar = NoncoherentXBar(
                 width=32,
-                frontend_latency=2,
+                frontend_latency=1,
                 forward_latency=1,
-                response_latency=2,
+                response_latency=1,
+                header_latency=1,
             )
+            self.cxl_xbar.clk_domain = self.pcie_fabric_clk_domain
 
             self.cxl_bridge = CXLBridge(
                 bridge_lat="50ns",
                 proto_proc_lat="12ns",
                 req_fifo_depth=128,
                 resp_fifo_depth=128,
+                optimal_pkt_size=256,
+                small_pkt_size=64,
+                small_pkt_overhead_pct=0,
+                large_pkt_size=4096,
+                large_pkt_overhead_pct=36,
             )
+            self.cxl_bridge.clk_domain = self.pcie_fabric_clk_domain
             self.cxl_bridge.cpu_side_port = (
                 self.get_cache_hierarchy().get_mem_side_port()
             )

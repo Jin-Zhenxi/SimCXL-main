@@ -26,6 +26,7 @@ MatrixFlowEngine::MatrixFlowEngine(const Params &p)
     : ClockedObject(p),
       dmaPort(*this, p.system),
       macArraySize(p.mac_array_size),
+      dmaChunkSize(p.dma_chunk_size),
       computeLatencyPerOp(p.compute_latency_per_op),
       phase(Phase::Idle),
       tileABuffer(kMaxTileDim * kMaxTileDim * sizeof(uint32_t), 0),
@@ -63,9 +64,10 @@ MatrixFlowEngine::MatrixFlowEngine(const Params &p)
     }
 
     DPRINTF(MatrixFlow,
-            "Create MatrixFlowEngine: mac_array_size=%u, "
+            "Create MatrixFlowEngine: mac_array_size=%u, dma_chunk_size=%uB, "
             "compute_latency_per_op=%llu cycles, maxTile=%d\n",
             macArraySize,
+            dmaChunkSize,
             static_cast<unsigned long long>(computeLatencyPerOp),
             kMaxTileDim);
 }
@@ -98,9 +100,11 @@ MatrixFlowEngine::init()
              "MatrixFlowEngine %s dma_port is not connected.\n", name());
 
     DPRINTF(MatrixFlow,
-            "Init done. tileA=%zuB tileB=%zuB tileC=%zuB dmaLine=%lluB\n",
+            "Init done. tileA=%zuB tileB=%zuB tileC=%zuB dmaLine=%lluB "
+            "dmaChunk=%uB\n",
             tileABuffer.size(), tileBBuffer.size(), tileCBuffer.size(),
-            static_cast<unsigned long long>(dmaPort.lineSize()));
+            static_cast<unsigned long long>(dmaPort.lineSize()),
+            dmaChunkSize);
 }
 
 uint64_t
@@ -159,7 +163,7 @@ MatrixFlowEngine::issueFetchDescriptor()
     stats.totalDmaBytesRead += sizeof(pendingDesc);
     dmaPort.dmaAction(
         MemCmd::ReadReq, pendingDescAddr, sizeof(pendingDesc),
-        &fetchDescCompleteEvent,
+        &fetchDescCompleteEvent, dmaChunkSize,
         reinterpret_cast<uint8_t *>(&pendingDesc), 0);
 }
 
@@ -257,7 +261,7 @@ MatrixFlowEngine::trySendMoreA()
 
         stats.totalDmaBytesRead += rowBytes;
         dmaPort.dmaAction(MemCmd::ReadReq, rowAddr, rowBytes,
-                          &fetchARowEvents[r], dst, 0);
+                          &fetchARowEvents[r], dmaChunkSize, dst, 0);
         ++reqsIssuedA;
     }
 }
@@ -304,7 +308,7 @@ MatrixFlowEngine::trySendMoreB()
 
         stats.totalDmaBytesRead += rowBytes;
         dmaPort.dmaAction(MemCmd::ReadReq, rowAddr, rowBytes,
-                          &fetchBRowEvents[r], dst, 0);
+                          &fetchBRowEvents[r], dmaChunkSize, dst, 0);
         ++reqsIssuedB;
     }
 }
@@ -351,7 +355,7 @@ MatrixFlowEngine::trySendMoreC()
 
         stats.totalDmaBytesWritten += rowBytes;
         dmaPort.dmaAction(MemCmd::WriteReq, rowAddr, rowBytes,
-                          &writeCRowEvents[r], src, 0);
+                          &writeCRowEvents[r], dmaChunkSize, src, 0);
         ++reqsIssuedC;
     }
 }
@@ -369,7 +373,7 @@ MatrixFlowEngine::issueWriteFlag()
     stats.totalDmaBytesWritten += sizeof(completionFlagValue);
     dmaPort.dmaAction(
         MemCmd::WriteReq, ctx.flagAddr, sizeof(completionFlagValue),
-        &writeFlagCompleteEvent,
+        &writeFlagCompleteEvent, dmaChunkSize,
         reinterpret_cast<uint8_t *>(&completionFlagValue), 0);
 }
 

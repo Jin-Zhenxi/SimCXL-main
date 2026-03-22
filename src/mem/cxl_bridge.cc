@@ -51,6 +51,7 @@
 #include "debug/MatrixFlow.hh"
 #include "params/Bridge.hh"
 #include "debug/CXLMemCtrl.hh"
+#include <cmath>
 #include <iterator>
 
 namespace gem5
@@ -91,9 +92,49 @@ CXLBridge::CXLBridge(const Params &p)
       cpuSidePort(p.name + ".cpu_side_port", *this, memSidePort,
                 ticksToCycles(p.bridge_lat), ticksToCycles(p.proto_proc_lat), p.resp_fifo_depth, p.ranges),
       memSidePort(p.name + ".mem_side_port", *this, cpuSidePort,
-                ticksToCycles(p.bridge_lat), ticksToCycles(p.proto_proc_lat), p.req_fifo_depth),      
-      stats(*this)
+                ticksToCycles(p.bridge_lat), ticksToCycles(p.proto_proc_lat), p.req_fifo_depth),
+      stats(*this),
+      optimalPktSize(p.optimal_pkt_size),
+      smallPktSize(p.small_pkt_size),
+      smallPktOverheadPct(p.small_pkt_overhead_pct),
+      largePktSize(p.large_pkt_size),
+      largePktOverheadPct(p.large_pkt_overhead_pct)
 {
+}
+
+Tick
+CXLBridge::packetEfficiencyPenalty(Tick payload_delay, unsigned pkt_size) const
+{
+    if (payload_delay == 0 || pkt_size == 0 || optimalPktSize == 0) {
+        return 0;
+    }
+
+    double overhead_pct = 0.0;
+    if (pkt_size < optimalPktSize) {
+        if (smallPktSize >= optimalPktSize || pkt_size <= smallPktSize) {
+            overhead_pct = smallPktOverheadPct;
+        } else {
+            const double span = static_cast<double>(optimalPktSize - smallPktSize);
+            const double pos = static_cast<double>(pkt_size - smallPktSize);
+            overhead_pct = smallPktOverheadPct * (1.0 - pos / span);
+        }
+    } else if (pkt_size > optimalPktSize) {
+        if (largePktSize <= optimalPktSize || pkt_size >= largePktSize) {
+            overhead_pct = largePktOverheadPct;
+        } else {
+            const double span = static_cast<double>(largePktSize - optimalPktSize);
+            const double pos = static_cast<double>(pkt_size - optimalPktSize);
+            overhead_pct = largePktOverheadPct * (pos / span);
+        }
+    }
+
+    if (overhead_pct <= 0.0) {
+        return 0;
+    }
+
+    return static_cast<Tick>(
+        std::llround(static_cast<double>(payload_delay) * overhead_pct / 100.0)
+    );
 }
 
 CXLBridge::CXLBridgeStats::CXLBridgeStats(CXLBridge &_bridge)
@@ -201,10 +242,12 @@ CXLBridge::BridgeRequestPort::recvTimingResp(PacketPtr pkt)
     // technically the packet only reaches us after the header delay,
     // and typically we also need to deserialise any payload (unless
     // the two sides of the bridge are synchronous)
-    Tick receive_delay = pkt->headerDelay + pkt->payloadDelay;
+    const Tick payload_delay = pkt->payloadDelay;
+    Tick receive_delay = pkt->headerDelay + payload_delay;
     pkt->headerDelay = pkt->payloadDelay = 0;
     auto total_delay = bridge_lat;
     if (pkt->getAddr() >= cpuSidePort.cxl_range.start() && pkt->getAddr() < cpuSidePort.cxl_range.end()) {
+        receive_delay += bridge.packetEfficiencyPenalty(payload_delay, pkt->getSize());
         total_delay = bridge_lat + proto_proc_lat;
         if (pkt->cxl_cmd == MemCmd::S2MDRS) {
             assert(pkt->isRead());
@@ -276,10 +319,12 @@ CXLBridge::BridgeResponsePort::recvTimingReq(PacketPtr pkt)
             // bridge_lat, and typically we also need to deserialise any
             // payload (unless the two sides of the bridge are
             // synchronous)
-            Tick receive_delay = pkt->headerDelay + pkt->payloadDelay;
+            const Tick payload_delay = pkt->payloadDelay;
+            Tick receive_delay = pkt->headerDelay + payload_delay;
             pkt->headerDelay = pkt->payloadDelay = 0;
             auto total_delay = bridge_lat;
             if (pkt->getAddr() >= cxl_range.start() && pkt->getAddr() < cxl_range.end()) {
+                receive_delay += bridge.packetEfficiencyPenalty(payload_delay, pkt->getSize());
                 total_delay = bridge_lat + proto_proc_lat;
                 if (pkt->isRead())
                     pkt->cxl_cmd = MemCmd::M2SReq;

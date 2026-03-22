@@ -346,6 +346,14 @@ class CXLBridge : public ClockedObject
 
     CXLBridgeStats stats;
 
+    const unsigned optimalPktSize;
+    const unsigned smallPktSize;
+    const unsigned smallPktOverheadPct;
+    const unsigned largePktSize;
+    const unsigned largePktOverheadPct;
+
+    Tick packetEfficiencyPenalty(Tick payload_delay, unsigned pkt_size) const;
+
   public:
 
     Port &getPort(const std::string &if_name,

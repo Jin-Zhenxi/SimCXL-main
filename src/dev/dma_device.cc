@@ -187,6 +187,35 @@ DmaPort::recvReqRetry()
 
 void
 DmaPort::dmaAction(Packet::Command cmd, Addr addr, int size, Event *event,
+                   Addr chunk_size, uint8_t *data,
+                   uint32_t sid, uint32_t ssid, Tick delay,
+                   Request::Flags flag)
+{
+    DPRINTF(DMA, "Starting DMA for addr: %#x size: %d chunk: %d sched: %d\n",
+            addr, size, chunk_size, event ? event->scheduled() : -1);
+
+    const Addr dmaChunk = chunk_size ? chunk_size : cacheLineSize;
+
+    // One DMA request sender state for every action, that is then
+    // split into many requests and packets based on the chosen chunk size.
+    transmitList.push_back(
+            new DmaReqState(cmd, addr, dmaChunk, size,
+                data, flag, requestorId, sid, ssid, event, delay));
+
+    sendDma();
+}
+
+void
+DmaPort::dmaAction(Packet::Command cmd, Addr addr, int size, Event *event,
+                   Addr chunk_size, uint8_t *data, Tick delay,
+                   Request::Flags flag)
+{
+    dmaAction(cmd, addr, size, event, chunk_size, data,
+              defaultSid, defaultSSid, delay, flag);
+}
+
+void
+DmaPort::dmaAction(Packet::Command cmd, Addr addr, int size, Event *event,
                    uint8_t *data, uint32_t sid, uint32_t ssid, Tick delay,
                    Request::Flags flag)
 {

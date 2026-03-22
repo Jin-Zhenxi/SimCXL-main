@@ -5,6 +5,8 @@ set -e
 echo "=================================================="
 echo "🚀 步骤 1: 呼叫 SCons 进行极速增量编译 (生成/更新 .o)"
 echo "=================================================="
+echo "[*] Clearing SCons probe cache: scons_config and sconsign.dblite"
+rm -rf build/X86/gem5.build/scons_config build/X86/gem5.build/sconsign.dblite
 scons build/X86/gem5.opt -j4 USE_TCMALLOC=False || true
 
 echo ""

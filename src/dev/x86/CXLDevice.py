@@ -24,7 +24,11 @@ class CXLMemCtrl(PciDevice):
     cxl_mem_range = Param.AddrRange("2GB", "CXL expander memory range that can be identified as system memory")
 
     matrix_engine = Param.MatrixFlowEngine(
-        MatrixFlowEngine(mac_array_size=16, compute_latency_per_op=1),
+        MatrixFlowEngine(
+            mac_array_size=16,
+            dma_chunk_size=64,
+            compute_latency_per_op=1,
+        ),
         "MatrixFlow compute engine (PNM accelerator)"
     )
 

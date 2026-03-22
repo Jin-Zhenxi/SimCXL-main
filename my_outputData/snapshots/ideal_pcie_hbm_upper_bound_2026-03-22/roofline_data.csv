@@ -1,0 +1,4 @@
+Preset,SeqLen,HiddenDim,MLPDim,NumHeads,GEMM Proxy Size,FLOPs,End-to-End ROI Latency (s),end_to_end_ms,phase1_ms,phase2_d2h_ms,phase2_softmax_ms,phase2_layernorm_ms,phase2_gelu_ms,phase2_residual_ms,phase2_h2d_ms,phase2_total_ms,phase3_ms,totalDmaRead,totalDmaWrite,totalComputeCycles,Operational Intensity (OI),Peak MAC Throughput (GFLOPS),Effective GEMM Peak (GFLOPS),Effective System Throughput (GFLOPS)
+ViT-Base-like,197,768,3072,12,197,30581492,0.103884,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,620984,155244,29867,39.3976,2457.413895,422.010008,0.294381
+ViT-Large-like,257,1024,4096,16,257,67898372,0.17725,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1585216,264204,66311,36.7133,2457.451898,376.114074,0.383066
+ViT-Huge-like,257,1280,5120,16,257,67898372,0.219524,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1585216,264204,66311,36.7133,2457.451898,375.600801,0.309298

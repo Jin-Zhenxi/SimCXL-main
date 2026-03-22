@@ -87,6 +87,26 @@ class CXLBridge(ClockedObject):
     resp_fifo_depth = Param.Unsigned(48, "The number of responses to buffer")
     bridge_lat = Param.Latency("50ns", "The latency of this bridge")
     proto_proc_lat = Param.Latency("14ns", "Conversion latency of cxl protocol in bridge")
+    optimal_pkt_size = Param.Unsigned(
+        256,
+        "Sweet-spot PCIe/CXL packet payload size in bytes",
+    )
+    small_pkt_size = Param.Unsigned(
+        64,
+        "Small-packet reference point for link efficiency modeling",
+    )
+    small_pkt_overhead_pct = Param.Unsigned(
+        12,
+        "Extra transfer overhead percentage at the small-packet point",
+    )
+    large_pkt_size = Param.Unsigned(
+        4096,
+        "Large-packet reference point for link efficiency modeling",
+    )
+    large_pkt_overhead_pct = Param.Unsigned(
+        36,
+        "Extra transfer overhead percentage at the large-packet point",
+    )
     ranges = VectorParam.AddrRange(
         [AllMemory], "Address ranges to pass through the bridge"
     )

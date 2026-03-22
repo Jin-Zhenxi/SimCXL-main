@@ -13,6 +13,9 @@ class MatrixFlowEngine(ClockedObject):
     dma_port = RequestPort("DMA request port for MatrixFlowEngine")
 
     mac_array_size = Param.Unsigned(16, "MAC array dimension (N for N x N)")
+    dma_chunk_size = Param.Unsigned(
+        256, "Preferred DMA payload granularity in bytes"
+    )
     compute_latency_per_op = Param.Cycles(
         1, "Compute latency in cycles per operation chunk"
     )
