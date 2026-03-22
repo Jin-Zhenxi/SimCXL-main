@@ -107,9 +107,21 @@ class SimpleSwitchableProcessor(SwitchableProcessor):
 
     def switch(self):
         """Switches to the "switched out" cores."""
+        current_mode = getattr(self._board, "mem_mode", "unset")
         if self._current_is_start:
+            target_key = self._switch_key
             self.switch_to_processor(self._switch_key)
         else:
+            target_key = self._start_key
             self.switch_to_processor(self._start_key)
+
+        target_core_type = self._switchable_cores[target_key][0].get_type()
+        target_mem_mode = get_mem_mode(target_core_type)
+        self._board.set_mem_mode(target_mem_mode)
+        print(
+            "after switch mem_mode="
+            f"{self._board.mem_mode} "
+            f"(prev={current_mode}, target_cpu={target_core_type.value})"
+        )
 
         self._current_is_start = not self._current_is_start

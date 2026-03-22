@@ -22,7 +22,7 @@ if [ "$SKIP_COMPILE" = false ]; then
     echo "=== 编译 trigger_gemm ==="
     GEM5_ROOT="$(cd "$SCRIPT_DIR" && pwd)"
     gcc -O0 -static -mno-80387 -o trigger_gemm trigger_gemm.c \
-        -I"$GEM5_ROOT/include" -L"$GEM5_ROOT/util/m5/build/x86/out" -lm5 \
+        -I"$GEM5_ROOT/include" -L"$GEM5_ROOT/util/m5/build/x86/out" -lm -lm5 \
         || { echo "编译失败，请先 cd util/m5 && scons build/x86 生成 libm5.a"; exit 1; }
 else
     echo "=== 跳过编译，使用已有 trigger_gemm ==="
