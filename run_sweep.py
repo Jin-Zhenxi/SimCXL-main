@@ -195,6 +195,7 @@ def extract_gemm_active_time(log_file):
 
 def extract_phase_timings(log_file):
     timings = {
+        "phase2_mode": "unknown",
         "phase1_ms": 0.0,
         "phase2_d2h_ms": 0.0,
         "phase2_softmax_ms": 0.0,
@@ -202,21 +203,54 @@ def extract_phase_timings(log_file):
         "phase2_gelu_ms": 0.0,
         "phase2_residual_ms": 0.0,
         "phase2_h2d_ms": 0.0,
+        "phase2_non_gemm_ms": 0.0,
         "phase2_total_ms": 0.0,
         "phase3_ms": 0.0,
         "end_to_end_ms": 0.0,
+        "host_mediated_copy_bytes": 0,
+        "phase2_read_bytes": 0,
+        "phase2_write_bytes": 0,
+        "phase2_read_accesses": 0,
+        "phase2_write_accesses": 0,
     }
 
     if not os.path.exists(log_file):
         return timings
 
-    with open(log_file, "r") as f:
-        text = f.read()
+    float_keys = [
+        "phase1_ms",
+        "phase2_d2h_ms",
+        "phase2_softmax_ms",
+        "phase2_layernorm_ms",
+        "phase2_gelu_ms",
+        "phase2_residual_ms",
+        "phase2_h2d_ms",
+        "phase2_non_gemm_ms",
+        "phase2_total_ms",
+        "phase3_ms",
+        "end_to_end_ms",
+    ]
+    int_keys = [
+        "host_mediated_copy_bytes",
+        "phase2_read_bytes",
+        "phase2_write_bytes",
+        "phase2_read_accesses",
+        "phase2_write_accesses",
+    ]
 
-    for key in timings:
-        match = re.search(rf"\[Timing\] {re.escape(key)}=([0-9.]+)", text)
-        if match:
-            timings[key] = float(match.group(1))
+    with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            mode_match = re.search(r"\[Timing\] phase2_mode=([A-Za-z0-9_]+)", line)
+            if mode_match:
+                timings["phase2_mode"] = mode_match.group(1)
+            for key in float_keys:
+                match = re.search(rf"\[Timing\] {re.escape(key)}=([0-9.]+)", line)
+                if match:
+                    timings[key] = float(match.group(1))
+            for key in int_keys:
+                match = re.search(rf"\[Timing\] {re.escape(key)}=(\d+)", line)
+                if match:
+                    timings[key] = int(match.group(1))
 
     return timings
 
@@ -279,7 +313,8 @@ def main():
                 f"未从 {stats_file} 提取到有效 ROI 统计。请检查日志: {log_file}"
             )
 
-        phase_timings = extract_phase_timings(log_file)
+        serial_log = os.path.join(m5out_dir, "board.pc.com_1.device")
+        phase_timings = extract_phase_timings(serial_log)
         flops = 4.0 * (seq_len**3)
         roi_latency_s = metrics["simSeconds"]
         gemm_active_s = extract_gemm_active_time(log_file)
@@ -306,9 +341,16 @@ def main():
             "MLPDim": preset["mlp_dim"],
             "NumHeads": preset["num_heads"],
             "GEMM Proxy Size": seq_len,
+            "Phase2 Mode": phase_timings["phase2_mode"],
             "FLOPs": int(flops),
             "End-to-End ROI Latency (s)": round(roi_latency_s, 6),
             "end_to_end_ms": round(phase_timings["end_to_end_ms"], 6),
+            "phase2_share_pct": round(
+                100.0 * phase_timings["phase2_total_ms"] /
+                phase_timings["end_to_end_ms"]
+                if phase_timings["end_to_end_ms"] > 0 else 0.0,
+                6,
+            ),
             "phase1_ms": round(phase_timings["phase1_ms"], 6),
             "phase2_d2h_ms": round(phase_timings["phase2_d2h_ms"], 6),
             "phase2_softmax_ms": round(phase_timings["phase2_softmax_ms"], 6),
@@ -320,8 +362,32 @@ def main():
                 phase_timings["phase2_residual_ms"], 6
             ),
             "phase2_h2d_ms": round(phase_timings["phase2_h2d_ms"], 6),
+            "phase2_non_gemm_ms": round(
+                phase_timings["phase2_non_gemm_ms"], 6
+            ),
             "phase2_total_ms": round(phase_timings["phase2_total_ms"], 6),
             "phase3_ms": round(phase_timings["phase3_ms"], 6),
+            "host_mediated_copy_bytes": phase_timings["host_mediated_copy_bytes"],
+            "phase2_read_bytes": phase_timings["phase2_read_bytes"],
+            "phase2_write_bytes": phase_timings["phase2_write_bytes"],
+            "phase2_read_accesses": phase_timings["phase2_read_accesses"],
+            "phase2_write_accesses": phase_timings["phase2_write_accesses"],
+            "phase2_total_bytes": (
+                phase_timings["phase2_read_bytes"] +
+                phase_timings["phase2_write_bytes"]
+            ),
+            "phase2_avg_read_size_B": round(
+                phase_timings["phase2_read_bytes"] /
+                phase_timings["phase2_read_accesses"]
+                if phase_timings["phase2_read_accesses"] > 0 else 0.0,
+                6,
+            ),
+            "phase2_avg_write_size_B": round(
+                phase_timings["phase2_write_bytes"] /
+                phase_timings["phase2_write_accesses"]
+                if phase_timings["phase2_write_accesses"] > 0 else 0.0,
+                6,
+            ),
             "totalDmaRead": metrics["dmaRead"],
             "totalDmaWrite": metrics["dmaWrite"],
             "totalComputeCycles": metrics["computeCycles"],

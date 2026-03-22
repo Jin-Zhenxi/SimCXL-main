@@ -287,6 +287,10 @@ main(int argc, char *argv[])
 
     unsigned long long phase2_begin = now_ns();
     printf("[Phase 2] host-side devm-copy + Non-GEMM proxy...\n");
+    const unsigned long long phase2_remote_read_bytes = matrix_bytes;
+    const unsigned long long phase2_remote_write_bytes = matrix_bytes;
+    const unsigned long long phase2_remote_read_accesses = 1;
+    const unsigned long long phase2_remote_write_accesses = 1;
 
     unsigned long long copy_d2h_begin = now_ns();
     memcpy(host_shadow_C, (const void *)matrix_C_cpu_ptr, matrix_bytes);
@@ -359,6 +363,7 @@ main(int argc, char *argv[])
     m5_dump_stats(0, 0);
 
     printf("[Timing] preset=%s\n", cfg.preset_name);
+    printf("[Timing] phase2_mode=devm_copy\n");
     printf("[Timing] phase1_ms=%.6f\n", (phase1_end - phase1_begin) / 1.0e6);
     printf("[Timing] phase2_d2h_ms=%.6f\n",
            (copy_d2h_end - copy_d2h_begin) / 1.0e6);
@@ -372,10 +377,21 @@ main(int argc, char *argv[])
            (residual_end - residual_begin) / 1.0e6);
     printf("[Timing] phase2_h2d_ms=%.6f\n",
            (copy_h2d_end - copy_h2d_begin) / 1.0e6);
+    printf("[Timing] phase2_non_gemm_ms=%.6f\n",
+           (softmax_end - softmax_begin +
+            layernorm_end - layernorm_begin +
+            gelu_end - gelu_begin +
+            residual_end - residual_begin) / 1.0e6);
     printf("[Timing] phase2_total_ms=%.6f\n",
            (phase2_end - phase2_begin) / 1.0e6);
     printf("[Timing] phase3_ms=%.6f\n", (phase3_end - phase3_begin) / 1.0e6);
     printf("[Timing] end_to_end_ms=%.6f\n", (total_end - phase1_begin) / 1.0e6);
+    printf("[Timing] host_mediated_copy_bytes=%llu\n", phase2_remote_read_bytes +
+           phase2_remote_write_bytes);
+    printf("[Timing] phase2_read_bytes=%llu\n", phase2_remote_read_bytes);
+    printf("[Timing] phase2_write_bytes=%llu\n", phase2_remote_write_bytes);
+    printf("[Timing] phase2_read_accesses=%llu\n", phase2_remote_read_accesses);
+    printf("[Timing] phase2_write_accesses=%llu\n", phase2_remote_write_accesses);
     printf("========== ViT-inspired proxy benchmark finished ==========\n");
 
     free(mlp_buf);
