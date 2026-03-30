@@ -1,11 +1,14 @@
 #!/bin/bash
 
-set -e 
+set -e
+
+JOBS="${JOBS:-4}"
 
 echo "=================================================="
 echo "🚀 步骤 1: 呼叫 SCons 进行极速增量编译 (生成/更新 .o)"
 echo "=================================================="
-scons build/X86/gem5.opt -j4 USE_TCMALLOC=False || true
+echo "🧵 使用并行编译线程数: $JOBS"
+scons build/X86/gem5.opt -j"$JOBS" USE_TCMALLOC=False || true
 
 echo ""
 echo "=================================================="

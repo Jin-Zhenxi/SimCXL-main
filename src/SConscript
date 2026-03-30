@@ -90,13 +90,23 @@ build_tools = Dir('#build_tools')
 gem5py_env = gem5py_env.Clone()
 gem5py = gem5py_env.File('gem5py', Dir(gem5py_env['BUILDDIR']))
 gem5py_m5 = gem5py_env.File('gem5py_m5', Dir(gem5py_env['BUILDDIR']))
-gem5py_env['GEM5PY'] = gem5py.get_abspath()
-gem5py_env['GEM5PY_M5'] = gem5py_m5.get_abspath()
+# On this host the tiny embedded helper `gem5py` is unstable during build-time
+# generator execution. Use the host interpreter for build-time generators,
+# including the SimObject codegen scripts, via a source-tree PYTHONPATH.
+gem5py_env['GEM5PY'] = sys.executable
+gem5py_env['GEM5PY_M5'] = sys.executable
 gem5py_env['OBJSUFFIX'] = '.pyo'
 # Inject build_tools into PYTHONPATH for when we run gem5py.
 pythonpath = gem5py_env['ENV'].get('PYTHONPATH', '').split(':')
 pythonpath.append(build_tools.abspath)
+pythonpath.append(Dir(env['BUILDDIR']).Dir('python').abspath)
+pythonpath.append(Dir('#src/python').abspath)
 gem5py_env['ENV']['PYTHONPATH'] = ':'.join(pythonpath)
+gem5py_env['ENV']['M5_SOURCE_OBJECTS_FALLBACK'] = '1'
+gem5py_env['ENV']['M5_SOURCE_OBJECTS_FALLBACK_ROOTS'] = os.pathsep.join(
+    [Dir('#src').abspath, Dir(env['BUILDDIR']).abspath]
+)
+gem5py_env['ENV']['M5_BUILD_PYTHON_DIR'] = Dir(env['BUILDDIR']).Dir('python').abspath
 
 class PySource(SourceFile):
     '''Add a python source file to the named package'''

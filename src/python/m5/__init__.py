@@ -39,6 +39,15 @@ except ImportError:
     # The import failed, we're being called from the build system
     in_gem5 = False
 
+if not in_gem5:
+    import os
+
+    extra_pkg_root = os.environ.get("M5_BUILD_PYTHON_DIR", "")
+    if extra_pkg_root:
+        extra_m5_dir = os.path.join(extra_pkg_root, "m5")
+        if os.path.isdir(extra_m5_dir) and extra_m5_dir not in __path__:
+            __path__.append(extra_m5_dir)
+
 if in_gem5:
     from . import (
         SimObject,

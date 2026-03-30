@@ -24,7 +24,7 @@ if [ -z "$TRIGGER" ]; then
 fi
 if [ -n "$TRIGGER" ]; then
     echo "Using trigger binary: $TRIGGER"
-    "$TRIGGER" 0x200000000 2048
+    "$TRIGGER" 0x200000000 257
 else
     echo "trigger_gemm not found. Run ./inject_trigger_gemm.sh first to add it to disk."
 fi

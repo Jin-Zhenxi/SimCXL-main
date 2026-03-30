@@ -528,8 +528,8 @@ main(int argc, char *argv[])
     unsigned long long cxl_base = 0x200000000ULL;
     unsigned long long hdm_base = 0x400000000ULL;
     uint32_t default_seq_len = 257;
-    uint32_t default_hidden_dim = 1280;
-    uint32_t default_mlp_dim = 5120;
+    uint32_t default_hidden_dim = 1024;
+    uint32_t default_mlp_dim = 4096;
     uint32_t default_num_heads = 16;
     const char *default_phase2_mode = "staged_block";
     uint32_t default_staged_block_bytes = 1024;
@@ -543,7 +543,7 @@ main(int argc, char *argv[])
 
     {
         struct VitProxyConfig cfg = {
-            .preset_name = "ViT-Huge-like",
+            .preset_name = "ViT-Large-like",
             .seq_len = default_seq_len,
             .hidden_dim = default_hidden_dim,
             .mlp_dim = default_mlp_dim,

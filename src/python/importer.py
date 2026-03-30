@@ -89,4 +89,6 @@ def install():
     sys.meta_path.insert(0, importer)
 
     # Injected into this module's namespace by the c++ code that loads it.
-    _init_all_embedded()
+    init_all = globals().get("_init_all_embedded")
+    if init_all is not None:
+        init_all()

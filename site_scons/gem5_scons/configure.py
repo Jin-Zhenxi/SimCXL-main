@@ -40,6 +40,8 @@
 
 import contextlib
 import os
+import subprocess
+import sys
 
 import SCons.Script
 import SCons.Util
@@ -99,27 +101,28 @@ int main(){{
 
 def CheckPythonLib(context):
     context.Message("Checking Python version... ")
-    ret = context.TryRun(
-        r"""
-#include <pybind11/embed.h>
-
-int
-main(int argc, char **argv) {
-    pybind11::scoped_interpreter guard{};
-    pybind11::exec(
-        "import sys\n"
-        "vi = sys.version_info\n"
-        "sys.stdout.write('%i.%i.%i' % (vi.major, vi.minor, vi.micro));\n");
-    return 0;
-}
-    """,
-        extension=".cc",
-    )
-    context.Result(ret[1] if ret[0] == 1 else 0)
-    if ret[0] == 0:
+    try:
+        ret = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys;"
+                    "vi=sys.version_info;"
+                    "print(f'{vi.major}.{vi.minor}.{vi.micro}', end='')"
+                ),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        context.Result(0)
         return None
-    else:
-        return tuple(map(int, ret[1].split(".")))
+
+    version = ret.stdout.strip()
+    context.Result(version)
+    return tuple(map(int, version.split(".")))
 
 
 def CheckPkgConfig(context, pkgs, *args):
