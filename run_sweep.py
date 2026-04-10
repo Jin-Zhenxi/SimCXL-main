@@ -37,9 +37,20 @@ DEFAULT_PHASE2_MODE = "staged_block"
 DEFAULT_STAGED_BLOCK_BYTES = 1024
 DEFAULT_MIN_READ_REQUEST_BYTES = 64
 MAX_INVALID_RUN_RETRIES = 3
+FORCE_RERUN = True
+RUN_ONLY_PRESET_NAMES = {"ViT-Large-like"}
+RUN_ONLY_LABELS = {
+    "ab_hierarchical_claim_hole_filling",
+    "b_vip_rescue_recurrence_aware_v3",
+    "b_mhot_gap_aware_next_cut",
+    "b_coverage_2d_gather_v2",
+    "b_coverage_2d_gather_no_starvation_v3",
+    "b_coverage_2d_gather_min_guarantee_first_cut",
+    "b_coverage_2d_gather_pingpong_first_cut",
+}
 PREFETCH_CONFIGS = [
     {
-        "label": "tail_baseline",
+        "label": "baseline_serial",
         "mode": "b_only",
         "trigger": "compute_launch",
         "rows_a": 0,
@@ -52,6 +63,836 @@ PREFETCH_CONFIGS = [
         "carry_over_inherit_inflight": 0,
         "hole_fill_lead_rows": 32,
         "writec_overlap_b_issue_budget_rows": 0,
+        "ab_scheduler_mode": "baseline",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+    },
+    {
+        "label": "ab_lightweight",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "ab_scheduler_mode": "lightweight",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+    },
+    {
+        "label": "ab_fullscore",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "ab_scheduler_mode": "fullscore",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+    },
+    {
+        "label": "ab_protected_b",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "ab_scheduler_mode": "protected_b",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "ab_hierarchical_protected_b",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "ab_scheduler_mode": "hierarchical_protected_b",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "ab_hierarchical_claim_hole_filling",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "ab_scheduler_mode": "hierarchical_claim_hole_filling",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "ab_hierarchical_claim_vip_pool",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "ab_scheduler_mode": "hierarchical_claim_vip_pool",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "dual_rx_ab_hierarchical_vip",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "ab_scheduler_mode": "dual_rx_ab_hierarchical_vip",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+        "vip_b_rows_capacity": 0,
+    },
+    {
+        "label": "vip_oracle_guided_single_run",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "ab_scheduler_mode": "vip_oracle_guided_single_run",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "vip_oracle_guided_mainline_only_64",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "ab_scheduler_mode": "vip_oracle_guided_mainline_only",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "vip_oracle_guided_mainline_only_128",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 128,
+        "ab_scheduler_mode": "vip_oracle_guided_mainline_only",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "vip_oracle_guided_mainline_only_256",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 256,
+        "ab_scheduler_mode": "vip_oracle_guided_mainline_only",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "vip_rescue_buffer_single_run",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "ab_scheduler_mode": "vip_rescue_buffer_single_run",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "b_vip_rescue_anti_dead_block_admission",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "ab_scheduler_mode": "b_vip_rescue_anti_dead_block_admission",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "b_vip_rescue_recurrence_aware_v2",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "ab_scheduler_mode": "b_vip_rescue_recurrence_aware_v2",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "b_vip_rescue_recurrence_aware_v3",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "ab_scheduler_mode": "b_vip_rescue_recurrence_aware_v3",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "b_mhot_mainline_default",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "mhot_b_rows_capacity": 128,
+        "ab_scheduler_mode": "b_mhot_mainline_default",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "b_mhot_mainline_enhanced",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "mhot_b_rows_capacity": 128,
+        "ab_scheduler_mode": "b_mhot_mainline_enhanced",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "b_mhot_runtime_first_cut",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "mhot_b_rows_capacity": 128,
+        "ab_scheduler_mode": "b_mhot_runtime_first_cut",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "b_mhot_gap_aware_next_cut",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "mhot_b_rows_capacity": 128,
+        "ab_scheduler_mode": "b_mhot_gap_aware_next_cut",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "b_mhot_coverage_blindspot_candidate_first_cut",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "mhot_b_rows_capacity": 128,
+        "ab_scheduler_mode": "b_mhot_coverage_blindspot_candidate_first_cut",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "b_mhot_coverage_blindspot_candidate_v2",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "mhot_b_rows_capacity": 128,
+        "ab_scheduler_mode": "b_mhot_coverage_blindspot_candidate_v2",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "b_coverage_shadow_controller_first_cut",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "mhot_b_rows_capacity": 128,
+        "coverage_shadow_rows_capacity": 128,
+        "ab_scheduler_mode": "b_coverage_shadow_controller_first_cut",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "b_coverage_shadow_controller_v2",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "mhot_b_rows_capacity": 128,
+        "coverage_shadow_rows_capacity": 128,
+        "ab_scheduler_mode": "b_coverage_shadow_controller_v2",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "b_coverage_2d_gather_first_cut",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "mhot_b_rows_capacity": 128,
+        "coverage_shadow_rows_capacity": 128,
+        "ab_scheduler_mode": "b_coverage_2d_gather_first_cut",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "b_coverage_2d_gather_v2",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "mhot_b_rows_capacity": 128,
+        "coverage_shadow_rows_capacity": 128,
+        "ab_scheduler_mode": "b_coverage_2d_gather_v2",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "b_coverage_2d_gather_no_starvation_v3",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "mhot_b_rows_capacity": 128,
+        "coverage_shadow_rows_capacity": 128,
+        "ab_scheduler_mode": "b_coverage_2d_gather_no_starvation_v3",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "b_coverage_2d_gather_min_guarantee_first_cut",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "mhot_b_rows_capacity": 128,
+        "coverage_shadow_rows_capacity": 128,
+        "coverage_gather_min_issue_budget": 8,
+        "ab_scheduler_mode": "b_coverage_2d_gather_min_guarantee_first_cut",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "b_coverage_2d_gather_pingpong_first_cut",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "mhot_b_rows_capacity": 128,
+        "coverage_shadow_rows_capacity": 128,
+        "ab_scheduler_mode": "b_coverage_2d_gather_pingpong_first_cut",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "ab_smart_pattern_prefetch_first_cut",
+        "mode": "a_b",
+        "trigger": "compute_launch",
+        "rows_a": 64,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "mhot_b_rows_capacity": 128,
+        "ab_scheduler_mode": "ab_smart_pattern_prefetch_first_cut",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "vip_ab_rescue_buffer_single_run_64",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 64,
+        "ab_scheduler_mode": "vip_ab_rescue_buffer_single_run",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
+    },
+    {
+        "label": "vip_ab_rescue_buffer_single_run_128",
+        "mode": "b_only",
+        "trigger": "compute_launch",
+        "rows_a": 0,
+        "rows_b": 32,
+        "rows_b_by_preset": {
+            "ViT-Base-like": 48,
+            "ViT-Large-like": 128,
+        },
+        "carry_over_max_rows": 0,
+        "carry_over_inherit_inflight": 0,
+        "hole_fill_lead_rows": 32,
+        "writec_overlap_b_issue_budget_rows": 0,
+        "vip_b_rows_capacity": 128,
+        "ab_scheduler_mode": "vip_ab_rescue_buffer_single_run",
+        "ab_a_min_credit_rows": 16,
+        "ab_bias_b": 1,
+        "ab_weight_urgency": 4,
+        "ab_weight_deficit": 3,
+        "ab_weight_reuse": 1,
+        "ab_weight_fallback_risk": 2,
+        "ab_min_launch_rows_a": 0,
+        "ab_min_launch_rows_b": 0,
+        "ab_current_protected_b_quota_rows": 4,
     },
 ]
 
@@ -96,6 +937,13 @@ def ensure_libm5():
             f"构建 libm5.a 失败。请手动执行: cd {m5_dir} && scons build/x86/out/libm5.a"
         )
     print("[*] libm5.a 构建完成")
+
+
+def should_run_case(preset, cfg):
+    return (
+        preset["name"] in RUN_ONLY_PRESET_NAMES
+        and cfg["label"] in RUN_ONLY_LABELS
+    )
 
 
 def modify_c_file(preset):
@@ -255,6 +1103,225 @@ def extract_prefetch_stats(stats_file):
         "next_output_progress_during_writec": 0,
         "b_rows_issued_during_writec": 0,
         "writec_blocked_b_issue_count": 0,
+        "a_rows_issued": 0,
+        "a_rows_ready_before_compute": 0,
+        "a_rows_inflight_peak": 0,
+        "b_rows_inflight_peak": 0,
+        "ab_parallel_fetch_overlap_cycles": 0,
+        "a_fetch_progress_during_b_fetch": 0,
+        "b_fetch_progress_during_a_fetch": 0,
+        "a_path_stall_waiting_for_b": 0,
+        "b_path_stall_waiting_for_a": 0,
+        "a_credit_floor_hits": 0,
+        "b_bias_wins": 0,
+        "urgency_priority_wins": 0,
+        "deficit_priority_wins": 0,
+        "reuse_priority_wins": 0,
+        "fallback_risk_priority_wins": 0,
+        "score_tie_break_count": 0,
+        "avg_score_a": 0.0,
+        "avg_score_b": 0.0,
+        "max_score_a": 0.0,
+        "max_score_b": 0.0,
+        "protected_b_issue_count": 0,
+        "protected_b_ready_count": 0,
+        "protected_b_priority_wins": 0,
+        "protected_b_blocks_a_count": 0,
+        "protected_b_blocks_normal_b_count": 0,
+        "protected_b_from_carry_over_count": 0,
+        "protected_b_from_next_output_count": 0,
+        "protected_b_from_hole_filling_count": 0,
+        "protected_b_from_compute_window_count": 0,
+        "future_protected_b_issue_count": 0,
+        "future_protected_b_priority_wins": 0,
+        "future_protected_b_blocks_a_count": 0,
+        "future_protected_b_blocks_current_b_count": 0,
+        "future_protected_b_from_next_output_count": 0,
+        "future_protected_b_from_future_hole_filling_count": 0,
+        "future_protected_b_ready_at_boundary_count": 0,
+        "current_protected_b_issue_count": 0,
+        "current_protected_b_priority_wins": 0,
+        "current_protected_b_blocks_a_count": 0,
+        "current_protected_b_quota_exhaust_count": 0,
+        "current_protected_b_from_compute_window_count": 0,
+        "current_protected_b_from_current_hole_filling_count": 0,
+        "b_rows_claimed_by_future": 0,
+        "future_claim_set_count": 0,
+        "future_claim_cleared_count": 0,
+        "future_claim_blocked_normal_fetch_count": 0,
+        "future_claim_expired_count": 0,
+        "future_claim_consumed_success_count": 0,
+        "future_claim_invalidated_count": 0,
+        "vip_pool_capacity": 0,
+        "vip_pool_occupancy_peak": 0,
+        "vip_insert_count": 0,
+        "vip_hit_count": 0,
+        "vip_miss_count": 0,
+        "vip_eviction_count": 0,
+        "vip_hit_on_next_output_count": 0,
+        "vip_hit_on_next_output_immediate_count": 0,
+        "vip_hit_on_next_output_near_count": 0,
+        "vip_hit_on_claimed_future_b_count": 0,
+        "vip_hit_on_carry_over_b_count": 0,
+        "vip_insert_from_next_output_count": 0,
+        "vip_insert_from_claim_count": 0,
+        "vip_insert_from_carry_over_count": 0,
+        "vip_materialize_to_current_count": 0,
+        "vip_b_rows_served_to_compute": 0,
+        "vip_b_rows_prevented_fallback_count": 0,
+        "vip_strong_admit_count": 0,
+        "vip_weak_admit_count": 0,
+        "vip_evict_low_priority_count": 0,
+        "vip_evict_weak_admit_count": 0,
+        "vip_evict_normal_count": 0,
+        "vip_admit_next_output_immediate_count": 0,
+        "vip_admit_next_output_near_count": 0,
+        "vip_admit_next_output_far_count": 0,
+        "vip_admit_claim_count": 0,
+        "vip_admit_carry_over_count": 0,
+        "vip_admit_current_window_immediate_count": 0,
+        "vip_reject_normal_near_count": 0,
+        "vip_reject_normal_far_count": 0,
+        "vip_reject_other_count": 0,
+        "oracle_selected_b_rows_count": 0,
+        "oracle_selected_rows_served_by_vip_count": 0,
+        "oracle_selected_rows_missed_by_vip_count": 0,
+        "vip_rescue_insert_count": 0,
+        "vip_rescue_hit_count": 0,
+        "vip_rescue_miss_count": 0,
+        "vip_rescue_eviction_count": 0,
+        "vip_rescue_served_to_compute_count": 0,
+        "vip_rescue_prevented_fallback_count": 0,
+        "vip_rescue_insert_after_fallback_count": 0,
+        "vip_rescue_insert_short_next_use_count": 0,
+        "vip_rescue_insert_multi_future_use_count": 0,
+        "vip_rescue_reused_count": 0,
+        "vip_rescue_a_insert_count": 0,
+        "vip_rescue_a_hit_count": 0,
+        "vip_rescue_a_miss_count": 0,
+        "vip_rescue_a_eviction_count": 0,
+        "vip_rescue_a_served_to_compute_count": 0,
+        "vip_rescue_a_prevented_remote_fetch_count": 0,
+        "vip_rescue_a_insert_short_next_use_count": 0,
+        "vip_rescue_a_insert_multi_future_use_count": 0,
+        "vip_rescue_a_reused_count": 0,
+        "mhot_pool_capacity": 0,
+        "mhot_occupancy_peak": 0,
+        "mhot_insert_count": 0,
+        "mhot_insert_default_count": 0,
+        "mhot_insert_enhanced_count": 0,
+        "mhot_insert_next_output_immediate_count": 0,
+        "mhot_insert_next_output_near_count": 0,
+        "mhot_insert_next_output_far_count": 0,
+        "mhot_insert_claim_count": 0,
+        "mhot_insert_carry_over_count": 0,
+        "mhot_insert_normal_near_count": 0,
+        "mhot_insert_current_window_far_count": 0,
+        "mhot_insert_coverage_blindspot_count": 0,
+        "mhot_hit_count": 0,
+        "mhot_hit_on_next_output_immediate_count": 0,
+        "mhot_hit_on_next_output_near_count": 0,
+        "mhot_hit_on_next_output_far_count": 0,
+        "mhot_hit_on_claim_count": 0,
+        "mhot_hit_on_carry_over_count": 0,
+        "mhot_hit_on_normal_near_count": 0,
+        "mhot_hit_on_current_window_far_count": 0,
+        "mhot_hit_on_coverage_blindspot_count": 0,
+        "mhot_rows_served_to_compute_count": 0,
+        "mhot_materialize_to_current_count": 0,
+        "mhot_eviction_count": 0,
+        "mhot_eviction_coverage_blindspot_count": 0,
+        "mhot_reuse_hit_count": 0,
+        "mhot_mainline_prevented_remote_count": 0,
+        "mhot_rows_served_to_compute_from_coverage_blindspot_count": 0,
+        "mhot_mainline_prevented_remote_from_coverage_blindspot_count": 0,
+        "mhot_checked_on_fallback_count": 0,
+        "mhot_miss_then_remote_count": 0,
+        "mhot_hit_before_remote_count": 0,
+        "coverage_shadow_pool_capacity": 0,
+        "coverage_shadow_occupancy_peak": 0,
+        "coverage_shadow_insert_count": 0,
+        "coverage_shadow_insert_from_next_k_count": 0,
+        "coverage_shadow_insert_from_next_output_count": 0,
+        "coverage_shadow_insert_from_gather_count": 0,
+        "coverage_shadow_hit_count": 0,
+        "coverage_shadow_rows_served_to_compute_count": 0,
+        "coverage_shadow_prevented_remote_count": 0,
+        "coverage_shadow_eviction_count": 0,
+        "coverage_shadow_checked_on_fallback_count": 0,
+        "coverage_shadow_miss_then_remote_count": 0,
+        "coverage_shadow_hit_before_remote_count": 0,
+        "coverage_shadow_prime_check_count": 0,
+        "coverage_shadow_prime_hit_count": 0,
+        "coverage_shadow_prime_miss_count": 0,
+        "coverage_shadow_prime_rows_materialized_count": 0,
+        "coverage_shadow_fallback_lookup_skipped_count": 0,
+        "coverage_gather_issue_count": 0,
+        "coverage_gather_completion_count": 0,
+        "coverage_gather_late_completion_count": 0,
+        "coverage_gather_target_rows": 0,
+        "mhot_coverage_blindspot_seen_count": 0,
+        "mhot_coverage_blindspot_repeat_count": 0,
+        "mhot_coverage_blindspot_promoted_count": 0,
+        "mhot_coverage_blindspot_reject_single_count": 0,
+        "mhot_coverage_blindspot_reject_long_distance_count": 0,
+        "mhot_coverage_blindspot_reject_low_reuse_count": 0,
+        "repeat_coverage_victim_count_total": 0,
+        "repeat_coverage_victim_promoted_count": 0,
+        "coverage_blindspot_short_next_use_count": 0,
+        "coverage_blindspot_future_reuse_gt1_count": 0,
+        "coverage_blindspot_first_seen_miss_count": 0,
+        "coverage_blindspot_repeat_miss_count": 0,
+        "coverage_blindspot_distinct_pattern_count": 0,
+        "coverage_blindspot_target_miss_count": 0,
+        "coverage_blindspot_target_first_seen_miss_count": 0,
+        "coverage_blindspot_target_repeat_miss_count": 0,
+        "coverage_blindspot_target_distinct_pattern_count": 0,
+        "fallback_autopsy_coverage_normal_immediate_count": 0,
+        "fallback_autopsy_coverage_normal_near_count": 0,
+        "fallback_autopsy_coverage_normal_far_count": 0,
+        "coverage_blindspot_seen_distance_immediate_count": 0,
+        "coverage_blindspot_seen_distance_near_count": 0,
+        "coverage_blindspot_seen_distance_far_count": 0,
+        "coverage_blindspot_promoted_distance_immediate_count": 0,
+        "coverage_blindspot_promoted_distance_near_count": 0,
+        "coverage_blindspot_promoted_distance_far_count": 0,
+        "mhot_hit_on_coverage_blindspot_immediate_count": 0,
+        "mhot_hit_on_coverage_blindspot_near_count": 0,
+        "mhot_hit_on_coverage_blindspot_far_count": 0,
+        "coverage_blindspot_seen_reuse_none_count": 0,
+        "coverage_blindspot_seen_reuse_one_count": 0,
+        "coverage_blindspot_seen_reuse_two_to_three_count": 0,
+        "coverage_blindspot_seen_reuse_four_plus_count": 0,
+        "coverage_blindspot_promoted_reuse_none_count": 0,
+        "coverage_blindspot_promoted_reuse_one_count": 0,
+        "coverage_blindspot_promoted_reuse_two_to_three_count": 0,
+        "coverage_blindspot_promoted_reuse_four_plus_count": 0,
+        "coverage_blindspot_seen_tile_lte4_count": 0,
+        "coverage_blindspot_seen_tile_lte12_count": 0,
+        "coverage_blindspot_seen_tile_lte24_count": 0,
+        "coverage_blindspot_seen_tile_gt24_count": 0,
+        "coverage_blindspot_promoted_tile_lte4_count": 0,
+        "coverage_blindspot_promoted_tile_lte12_count": 0,
+        "coverage_blindspot_promoted_tile_lte24_count": 0,
+        "coverage_blindspot_promoted_tile_gt24_count": 0,
+        "fallback_autopsy_timeliness_count": 0,
+        "fallback_autopsy_churn_count": 0,
+        "fallback_autopsy_coverage_count": 0,
+        "rx_a_issue_count": 0,
+        "rx_b_issue_count": 0,
+        "rx_a_ready_count": 0,
+        "rx_b_ready_count": 0,
+        "rx_a_queue_occupancy_peak": 0,
+        "rx_b_queue_occupancy_peak": 0,
+        "rx_a_stall_cycles": 0,
+        "rx_b_stall_cycles": 0,
+        "rx_a_priority_wins": 0,
+        "rx_b_priority_wins": 0,
+        "rx_b_deficit_wins": 0,
+        "rx_a_deficit_wins": 0,
+        "rx_b_deadline_wins": 0,
+        "rx_a_deadline_wins": 0,
     }
     if not os.path.exists(stats_file):
         return stats
@@ -293,12 +1360,271 @@ def extract_prefetch_stats(stats_file):
         "next_output_progress_during_writec": r"matrix_engine\.nextOutputProgressDuringWriteC\s+(\d+)",
         "b_rows_issued_during_writec": r"matrix_engine\.bRowsIssuedDuringWriteC\s+(\d+)",
         "writec_blocked_b_issue_count": r"matrix_engine\.writeCBlockedBIssueCount\s+(\d+)",
+        "a_rows_issued": r"matrix_engine\.aRowsIssued\s+(\d+)",
+        "a_rows_ready_before_compute": r"matrix_engine\.aRowsReadyBeforeCompute\s+(\d+)",
+        "a_rows_inflight_peak": r"matrix_engine\.aRowsInflightPeak\s+(\d+)",
+        "b_rows_inflight_peak": r"matrix_engine\.bRowsInflightPeak\s+(\d+)",
+        "ab_parallel_fetch_overlap_cycles": r"matrix_engine\.abParallelFetchOverlapCycles\s+(\d+)",
+        "a_fetch_progress_during_b_fetch": r"matrix_engine\.aFetchProgressDuringBFetch\s+(\d+)",
+        "b_fetch_progress_during_a_fetch": r"matrix_engine\.bFetchProgressDuringAFetch\s+(\d+)",
+        "a_path_stall_waiting_for_b": r"matrix_engine\.aPathStallWaitingForB\s+(\d+)",
+        "b_path_stall_waiting_for_a": r"matrix_engine\.bPathStallWaitingForA\s+(\d+)",
+        "a_credit_floor_hits": r"matrix_engine\.aCreditFloorHits\s+(\d+)",
+        "b_bias_wins": r"matrix_engine\.bBiasWins\s+(\d+)",
+        "urgency_priority_wins": r"matrix_engine\.urgencyPriorityWins\s+(\d+)",
+        "deficit_priority_wins": r"matrix_engine\.deficitPriorityWins\s+(\d+)",
+        "reuse_priority_wins": r"matrix_engine\.reusePriorityWins\s+(\d+)",
+        "fallback_risk_priority_wins": r"matrix_engine\.fallbackRiskPriorityWins\s+(\d+)",
+        "score_tie_break_count": r"matrix_engine\.scoreTieBreakCount\s+(\d+)",
+        "avg_score_a": r"matrix_engine\.avgScoreA\s+([0-9.]+)",
+        "avg_score_b": r"matrix_engine\.avgScoreB\s+([0-9.]+)",
+        "max_score_a": r"matrix_engine\.maxScoreA\s+([0-9.]+)",
+        "max_score_b": r"matrix_engine\.maxScoreB\s+([0-9.]+)",
+        "protected_b_issue_count": r"matrix_engine\.protectedBIssueCount\s+(\d+)",
+        "protected_b_ready_count": r"matrix_engine\.protectedBReadyCount\s+(\d+)",
+        "protected_b_priority_wins": r"matrix_engine\.protectedBPriorityWins\s+(\d+)",
+        "protected_b_blocks_a_count": r"matrix_engine\.protectedBBlocksACount\s+(\d+)",
+        "protected_b_blocks_normal_b_count": r"matrix_engine\.protectedBBlocksNormalBCount\s+(\d+)",
+        "protected_b_from_carry_over_count": r"matrix_engine\.protectedBFromCarryOverCount\s+(\d+)",
+        "protected_b_from_next_output_count": r"matrix_engine\.protectedBFromNextOutputCount\s+(\d+)",
+        "protected_b_from_hole_filling_count": r"matrix_engine\.protectedBFromHoleFillingCount\s+(\d+)",
+        "protected_b_from_compute_window_count": r"matrix_engine\.protectedBFromComputeWindowCount\s+(\d+)",
+        "future_protected_b_issue_count": r"matrix_engine\.futureProtectedBIssueCount\s+(\d+)",
+        "future_protected_b_priority_wins": r"matrix_engine\.futureProtectedBPriorityWins\s+(\d+)",
+        "future_protected_b_blocks_a_count": r"matrix_engine\.futureProtectedBBlocksACount\s+(\d+)",
+        "future_protected_b_blocks_current_b_count": r"matrix_engine\.futureProtectedBBlocksCurrentBCount\s+(\d+)",
+        "future_protected_b_from_next_output_count": r"matrix_engine\.futureProtectedBFromNextOutputCount\s+(\d+)",
+        "future_protected_b_from_future_hole_filling_count": r"matrix_engine\.futureProtectedBFromFutureHoleFillingCount\s+(\d+)",
+        "future_protected_b_ready_at_boundary_count": r"matrix_engine\.futureProtectedBReadyAtBoundaryCount\s+(\d+)",
+        "current_protected_b_issue_count": r"matrix_engine\.currentProtectedBIssueCount\s+(\d+)",
+        "current_protected_b_priority_wins": r"matrix_engine\.currentProtectedBPriorityWins\s+(\d+)",
+        "current_protected_b_blocks_a_count": r"matrix_engine\.currentProtectedBBlocksACount\s+(\d+)",
+        "current_protected_b_quota_exhaust_count": r"matrix_engine\.currentProtectedBQuotaExhaustCount\s+(\d+)",
+        "current_protected_b_from_compute_window_count": r"matrix_engine\.currentProtectedBFromComputeWindowCount\s+(\d+)",
+        "current_protected_b_from_current_hole_filling_count": r"matrix_engine\.currentProtectedBFromCurrentHoleFillingCount\s+(\d+)",
+        "b_rows_claimed_by_future": r"matrix_engine\.bRowsClaimedByFuture\s+(\d+)",
+        "future_claim_set_count": r"matrix_engine\.futureClaimSetCount\s+(\d+)",
+        "future_claim_cleared_count": r"matrix_engine\.futureClaimClearedCount\s+(\d+)",
+        "future_claim_blocked_normal_fetch_count": r"matrix_engine\.futureClaimBlockedNormalFetchCount\s+(\d+)",
+        "future_claim_expired_count": r"matrix_engine\.futureClaimExpiredCount\s+(\d+)",
+        "future_claim_consumed_success_count": r"matrix_engine\.futureClaimConsumedSuccessCount\s+(\d+)",
+        "future_claim_invalidated_count": r"matrix_engine\.futureClaimInvalidatedCount\s+(\d+)",
+        "vip_pool_capacity": r"matrix_engine\.vipPoolCapacity\s+(\d+)",
+        "vip_pool_occupancy_peak": r"matrix_engine\.vipPoolOccupancyPeak\s+(\d+)",
+        "vip_insert_count": r"matrix_engine\.vipInsertCount\s+(\d+)",
+        "vip_hit_count": r"matrix_engine\.vipHitCount\s+(\d+)",
+        "vip_miss_count": r"matrix_engine\.vipMissCount\s+(\d+)",
+        "vip_eviction_count": r"matrix_engine\.vipEvictionCount\s+(\d+)",
+        "vip_hit_on_next_output_count": r"matrix_engine\.vipHitOnNextOutputCount\s+(\d+)",
+        "vip_hit_on_next_output_immediate_count": r"matrix_engine\.vipHitOnNextOutputImmediateCount\s+(\d+)",
+        "vip_hit_on_next_output_near_count": r"matrix_engine\.vipHitOnNextOutputNearCount\s+(\d+)",
+        "vip_hit_on_claimed_future_b_count": r"matrix_engine\.vipHitOnClaimedFutureBCount\s+(\d+)",
+        "vip_hit_on_carry_over_b_count": r"matrix_engine\.vipHitOnCarryOverBCount\s+(\d+)",
+        "vip_insert_from_next_output_count": r"matrix_engine\.vipInsertFromNextOutputCount\s+(\d+)",
+        "vip_insert_from_claim_count": r"matrix_engine\.vipInsertFromClaimCount\s+(\d+)",
+        "vip_insert_from_carry_over_count": r"matrix_engine\.vipInsertFromCarryOverCount\s+(\d+)",
+        "vip_materialize_to_current_count": r"matrix_engine\.vipMaterializeToCurrentCount\s+(\d+)",
+        "vip_b_rows_served_to_compute": r"matrix_engine\.vipBRowsServedToCompute\s+(\d+)",
+        "vip_b_rows_prevented_fallback_count": r"matrix_engine\.vipBRowsPreventedFallbackCount\s+(\d+)",
+        "vip_strong_admit_count": r"matrix_engine\.vipStrongAdmitCount\s+(\d+)",
+        "vip_weak_admit_count": r"matrix_engine\.vipWeakAdmitCount\s+(\d+)",
+        "vip_evict_low_priority_count": r"matrix_engine\.vipEvictLowPriorityCount\s+(\d+)",
+        "vip_evict_weak_admit_count": r"matrix_engine\.vipEvictWeakAdmitCount\s+(\d+)",
+        "vip_evict_normal_count": r"matrix_engine\.vipEvictNormalCount\s+(\d+)",
+        "vip_admit_next_output_immediate_count": r"matrix_engine\.vipAdmitNextOutputImmediateCount\s+(\d+)",
+        "vip_admit_next_output_near_count": r"matrix_engine\.vipAdmitNextOutputNearCount\s+(\d+)",
+        "vip_admit_next_output_far_count": r"matrix_engine\.vipAdmitNextOutputFarCount\s+(\d+)",
+        "vip_admit_claim_count": r"matrix_engine\.vipAdmitClaimCount\s+(\d+)",
+        "vip_admit_carry_over_count": r"matrix_engine\.vipAdmitCarryOverCount\s+(\d+)",
+        "vip_admit_current_window_immediate_count": r"matrix_engine\.vipAdmitCurrentWindowImmediateCount\s+(\d+)",
+        "vip_reject_normal_near_count": r"matrix_engine\.vipRejectNormalNearCount\s+(\d+)",
+        "vip_reject_normal_far_count": r"matrix_engine\.vipRejectNormalFarCount\s+(\d+)",
+        "vip_reject_other_count": r"matrix_engine\.vipRejectOtherCount\s+(\d+)",
+        "oracle_selected_b_rows_count": r"matrix_engine\.oracleSelectedBRowsCount\s+(\d+)",
+        "oracle_selected_rows_served_by_vip_count": r"matrix_engine\.oracleSelectedRowsServedByVipCount\s+(\d+)",
+        "oracle_selected_rows_missed_by_vip_count": r"matrix_engine\.oracleSelectedRowsMissedByVipCount\s+(\d+)",
+        "vip_rescue_insert_count": r"matrix_engine\.vipRescueInsertCount\s+(\d+)",
+        "vip_rescue_hit_count": r"matrix_engine\.vipRescueHitCount\s+(\d+)",
+        "vip_rescue_miss_count": r"matrix_engine\.vipRescueMissCount\s+(\d+)",
+        "vip_rescue_eviction_count": r"matrix_engine\.vipRescueEvictionCount\s+(\d+)",
+        "vip_rescue_served_to_compute_count": r"matrix_engine\.vipRescueServedToComputeCount\s+(\d+)",
+        "vip_rescue_prevented_fallback_count": r"matrix_engine\.vipRescuePreventedFallbackCount\s+(\d+)",
+        "vip_rescue_insert_after_fallback_count": r"matrix_engine\.vipRescueInsertAfterFallbackCount\s+(\d+)",
+        "vip_rescue_insert_short_next_use_count": r"matrix_engine\.vipRescueInsertShortNextUseCount\s+(\d+)",
+        "vip_rescue_insert_multi_future_use_count": r"matrix_engine\.vipRescueInsertMultiFutureUseCount\s+(\d+)",
+        "vip_rescue_reused_count": r"matrix_engine\.vipRescueReusedCount\s+(\d+)",
+        "vip_rescue_insert_strong_count": r"matrix_engine\.vipRescueInsertStrongCount\s+(\d+)",
+        "vip_rescue_insert_weak_count": r"matrix_engine\.vipRescueInsertWeakCount\s+(\d+)",
+        "vip_rescue_reject_non_fallback_count": r"matrix_engine\.vipRescueRejectNonFallbackCount\s+(\d+)",
+        "vip_rescue_reject_not_short_use_count": r"matrix_engine\.vipRescueRejectNotShortUseCount\s+(\d+)",
+        "vip_rescue_reject_not_critical_count": r"matrix_engine\.vipRescueRejectNotCriticalCount\s+(\d+)",
+        "vip_rescue_reject_not_rescue_critical_count": r"matrix_engine\.vipRescueRejectNotRescueCriticalCount\s+(\d+)",
+        "vip_rescue_reject_single_use_count": r"matrix_engine\.vipRescueRejectSingleUseCount\s+(\d+)",
+        "vip_rescue_reject_non_repeat_count": r"matrix_engine\.vipRescueRejectNonRepeatCount\s+(\d+)",
+        "repeat_victim_count_total": r"matrix_engine\.repeatVictimCountTotal\s+(\d+)",
+        "repeat_victim_promoted_count": r"matrix_engine\.repeatVictimPromotedCount\s+(\d+)",
+        "critical_window_victim_count": r"matrix_engine\.criticalWindowVictimCount\s+(\d+)",
+        "critical_window_vip_insert_count": r"matrix_engine\.criticalWindowVipInsertCount\s+(\d+)",
+        "weak_rescue_promoted_on_first_fallback_count": r"matrix_engine\.weakRescuePromotedOnFirstFallbackCount\s+(\d+)",
+        "strong_rescue_promoted_on_recurrence_count": r"matrix_engine\.strongRescuePromotedOnRecurrenceCount\s+(\d+)",
+        "rescue_criticality_high_count": r"matrix_engine\.rescueCriticalityHighCount\s+(\d+)",
+        "next_rescue_opportunity_near_count": r"matrix_engine\.nextRescueOpportunityNearCount\s+(\d+)",
+        "eligible_rescue_victims_first_seen_count": r"matrix_engine\.eligibleRescueVictimsFirstSeenCount\s+(\d+)",
+        "eligible_rescue_victims_promoted_early_count": r"matrix_engine\.eligibleRescueVictimsPromotedEarlyCount\s+(\d+)",
+        "eligible_rescue_victims_hit_after_first_promotion_count": r"matrix_engine\.eligibleRescueVictimsHitAfterFirstPromotionCount\s+(\d+)",
+        "vip_rescue_a_insert_count": r"matrix_engine\.vipRescueAInsertCount\s+(\d+)",
+        "vip_rescue_a_hit_count": r"matrix_engine\.vipRescueAHitCount\s+(\d+)",
+        "vip_rescue_a_miss_count": r"matrix_engine\.vipRescueAMissCount\s+(\d+)",
+        "vip_rescue_a_eviction_count": r"matrix_engine\.vipRescueAEvictionCount\s+(\d+)",
+        "vip_rescue_a_served_to_compute_count": r"matrix_engine\.vipRescueAServedToComputeCount\s+(\d+)",
+        "vip_rescue_a_prevented_remote_fetch_count": r"matrix_engine\.vipRescueAPreventedRemoteFetchCount\s+(\d+)",
+        "vip_rescue_a_insert_short_next_use_count": r"matrix_engine\.vipRescueAInsertShortNextUseCount\s+(\d+)",
+        "vip_rescue_a_insert_multi_future_use_count": r"matrix_engine\.vipRescueAInsertMultiFutureUseCount\s+(\d+)",
+        "vip_rescue_a_reused_count": r"matrix_engine\.vipRescueAReusedCount\s+(\d+)",
+        "mhot_pool_capacity": r"matrix_engine\.mhotPoolCapacity\s+(\d+)",
+        "mhot_occupancy_peak": r"matrix_engine\.mhotOccupancyPeak\s+(\d+)",
+        "mhot_insert_count": r"matrix_engine\.mhotInsertCount\s+(\d+)",
+        "mhot_insert_default_count": r"matrix_engine\.mhotInsertDefaultCount\s+(\d+)",
+        "mhot_insert_enhanced_count": r"matrix_engine\.mhotInsertEnhancedCount\s+(\d+)",
+        "mhot_insert_next_output_immediate_count": r"matrix_engine\.mhotInsertNextOutputImmediateCount\s+(\d+)",
+        "mhot_insert_next_output_near_count": r"matrix_engine\.mhotInsertNextOutputNearCount\s+(\d+)",
+        "mhot_insert_next_output_far_count": r"matrix_engine\.mhotInsertNextOutputFarCount\s+(\d+)",
+        "mhot_insert_claim_count": r"matrix_engine\.mhotInsertClaimCount\s+(\d+)",
+        "mhot_insert_carry_over_count": r"matrix_engine\.mhotInsertCarryOverCount\s+(\d+)",
+        "mhot_insert_normal_near_count": r"matrix_engine\.mhotInsertNormalNearCount\s+(\d+)",
+        "mhot_insert_current_window_far_count": r"matrix_engine\.mhotInsertCurrentWindowFarCount\s+(\d+)",
+        "mhot_insert_coverage_blindspot_count": r"matrix_engine\.mhotInsertCoverageBlindspotCount\s+(\d+)",
+        "mhot_hit_count": r"matrix_engine\.mhotHitCount\s+(\d+)",
+        "mhot_hit_on_next_output_immediate_count": r"matrix_engine\.mhotHitOnNextOutputImmediateCount\s+(\d+)",
+        "mhot_hit_on_next_output_near_count": r"matrix_engine\.mhotHitOnNextOutputNearCount\s+(\d+)",
+        "mhot_hit_on_next_output_far_count": r"matrix_engine\.mhotHitOnNextOutputFarCount\s+(\d+)",
+        "mhot_hit_on_claim_count": r"matrix_engine\.mhotHitOnClaimCount\s+(\d+)",
+        "mhot_hit_on_carry_over_count": r"matrix_engine\.mhotHitOnCarryOverCount\s+(\d+)",
+        "mhot_hit_on_normal_near_count": r"matrix_engine\.mhotHitOnNormalNearCount\s+(\d+)",
+        "mhot_hit_on_current_window_far_count": r"matrix_engine\.mhotHitOnCurrentWindowFarCount\s+(\d+)",
+        "mhot_hit_on_coverage_blindspot_count": r"matrix_engine\.mhotHitOnCoverageBlindspotCount\s+(\d+)",
+        "mhot_rows_served_to_compute_count": r"matrix_engine\.mhotRowsServedToComputeCount\s+(\d+)",
+        "mhot_materialize_to_current_count": r"matrix_engine\.mhotMaterializeToCurrentCount\s+(\d+)",
+        "mhot_eviction_count": r"matrix_engine\.mhotEvictionCount\s+(\d+)",
+        "mhot_eviction_coverage_blindspot_count": r"matrix_engine\.mhotEvictionCoverageBlindspotCount\s+(\d+)",
+        "mhot_reuse_hit_count": r"matrix_engine\.mhotReuseHitCount\s+(\d+)",
+        "mhot_mainline_prevented_remote_count": r"matrix_engine\.mhotMainlinePreventedRemoteCount\s+(\d+)",
+        "mhot_rows_served_to_compute_from_coverage_blindspot_count": r"matrix_engine\.mhotRowsServedToComputeFromCoverageBlindspotCount\s+(\d+)",
+        "mhot_mainline_prevented_remote_from_coverage_blindspot_count": r"matrix_engine\.mhotMainlinePreventedRemoteFromCoverageBlindspotCount\s+(\d+)",
+        "mhot_checked_on_fallback_count": r"matrix_engine\.mhotCheckedOnFallbackCount\s+(\d+)",
+        "mhot_miss_then_remote_count": r"matrix_engine\.mhotMissThenRemoteCount\s+(\d+)",
+        "mhot_hit_before_remote_count": r"matrix_engine\.mhotHitBeforeRemoteCount\s+(\d+)",
+        "coverage_shadow_pool_capacity": r"matrix_engine\.coverageShadowPoolCapacity\s+(\d+)",
+        "coverage_shadow_occupancy_peak": r"matrix_engine\.coverageShadowOccupancyPeak\s+(\d+)",
+        "coverage_shadow_insert_count": r"matrix_engine\.coverageShadowInsertCount\s+(\d+)",
+        "coverage_shadow_insert_from_next_k_count": r"matrix_engine\.coverageShadowInsertFromNextKCount\s+(\d+)",
+        "coverage_shadow_insert_from_next_output_count": r"matrix_engine\.coverageShadowInsertFromNextOutputCount\s+(\d+)",
+        "coverage_shadow_insert_from_gather_count": r"matrix_engine\.coverageShadowInsertFromGatherCount\s+(\d+)",
+        "coverage_shadow_hit_count": r"matrix_engine\.coverageShadowHitCount\s+(\d+)",
+        "coverage_shadow_rows_served_to_compute_count": r"matrix_engine\.coverageShadowRowsServedToComputeCount\s+(\d+)",
+        "coverage_shadow_prevented_remote_count": r"matrix_engine\.coverageShadowPreventedRemoteCount\s+(\d+)",
+        "coverage_shadow_eviction_count": r"matrix_engine\.coverageShadowEvictionCount\s+(\d+)",
+        "coverage_shadow_checked_on_fallback_count": r"matrix_engine\.coverageShadowCheckedOnFallbackCount\s+(\d+)",
+        "coverage_shadow_miss_then_remote_count": r"matrix_engine\.coverageShadowMissThenRemoteCount\s+(\d+)",
+        "coverage_shadow_hit_before_remote_count": r"matrix_engine\.coverageShadowHitBeforeRemoteCount\s+(\d+)",
+        "coverage_shadow_prime_check_count": r"matrix_engine\.coverageShadowPrimeCheckCount\s+(\d+)",
+        "coverage_shadow_prime_hit_count": r"matrix_engine\.coverageShadowPrimeHitCount\s+(\d+)",
+        "coverage_shadow_prime_miss_count": r"matrix_engine\.coverageShadowPrimeMissCount\s+(\d+)",
+        "coverage_shadow_prime_rows_materialized_count": r"matrix_engine\.coverageShadowPrimeRowsMaterializedCount\s+(\d+)",
+        "coverage_shadow_fallback_lookup_skipped_count": r"matrix_engine\.coverageShadowFallbackLookupSkippedCount\s+(\d+)",
+        "coverage_gather_issue_count": r"matrix_engine\.coverageGatherIssueCount\s+(\d+)",
+        "coverage_gather_completion_count": r"matrix_engine\.coverageGatherCompletionCount\s+(\d+)",
+        "coverage_gather_late_completion_count": r"matrix_engine\.coverageGatherLateCompletionCount\s+(\d+)",
+        "coverage_gather_target_rows": r"matrix_engine\.coverageGatherTargetRows\s+(\d+)",
+        "coverage_gather_completion_while_row_empty_count": r"matrix_engine\.coverageGatherCompletionWhileRowEmptyCount\s+(\d+)",
+        "coverage_gather_completion_while_row_inflight_count": r"matrix_engine\.coverageGatherCompletionWhileRowInflightCount\s+(\d+)",
+        "coverage_gather_completion_while_row_ready_count": r"matrix_engine\.coverageGatherCompletionWhileRowReadyCount\s+(\d+)",
+        "coverage_gather_completion_while_row_consumed_count": r"matrix_engine\.coverageGatherCompletionWhileRowConsumedCount\s+(\d+)",
+        "gather_deferred_by_mainline_count": r"matrix_engine\.gatherDeferredByMainlineCount\s+(\d+)",
+        "mainline_credit_reserved_count": r"matrix_engine\.mainlineCreditReservedCount\s+(\d+)",
+        "gather_blocked_by_mainline_grace_window_count": r"matrix_engine\.gatherBlockedByMainlineGraceWindowCount\s+(\d+)",
+        "gather_deferred_by_vip_count": r"matrix_engine\.gatherDeferredByVipCount\s+(\d+)",
+        "vip_deferred_by_gather_count": r"matrix_engine\.vipDeferredByGatherCount\s+(\d+)",
+        "vip_rescue_mode_active_count": r"matrix_engine\.vipRescueModeActiveCount\s+(\d+)",
+        "gather_budget_exhausted_count": r"matrix_engine\.gatherBudgetExhaustedCount\s+(\d+)",
+        "gather_max_consecutive_issue_hits_count": r"matrix_engine\.gatherMaxConsecutiveIssueHitsCount\s+(\d+)",
+        "gather_candidate_aged_up_count": r"matrix_engine\.gatherCandidateAgedUpCount\s+(\d+)",
+        "gather_dropped_due_to_deadline_count": r"matrix_engine\.gatherDroppedDueToDeadlineCount\s+(\d+)",
+        "mhot_coverage_blindspot_seen_count": r"matrix_engine\.mhotCoverageBlindspotSeenCount\s+(\d+)",
+        "mhot_coverage_blindspot_repeat_count": r"matrix_engine\.mhotCoverageBlindspotRepeatCount\s+(\d+)",
+        "mhot_coverage_blindspot_promoted_count": r"matrix_engine\.mhotCoverageBlindspotPromotedCount\s+(\d+)",
+        "mhot_coverage_blindspot_reject_single_count": r"matrix_engine\.mhotCoverageBlindspotRejectSingleCount\s+(\d+)",
+        "mhot_coverage_blindspot_reject_long_distance_count": r"matrix_engine\.mhotCoverageBlindspotRejectLongDistanceCount\s+(\d+)",
+        "mhot_coverage_blindspot_reject_low_reuse_count": r"matrix_engine\.mhotCoverageBlindspotRejectLowReuseCount\s+(\d+)",
+        "repeat_coverage_victim_count_total": r"matrix_engine\.repeatCoverageVictimCountTotal\s+(\d+)",
+        "repeat_coverage_victim_promoted_count": r"matrix_engine\.repeatCoverageVictimPromotedCount\s+(\d+)",
+        "coverage_blindspot_short_next_use_count": r"matrix_engine\.coverageBlindspotShortNextUseCount\s+(\d+)",
+        "coverage_blindspot_future_reuse_gt1_count": r"matrix_engine\.coverageBlindspotFutureReuseGt1Count\s+(\d+)",
+        "coverage_blindspot_first_seen_miss_count": r"matrix_engine\.coverageBlindspotFirstSeenMissCount\s+(\d+)",
+        "coverage_blindspot_repeat_miss_count": r"matrix_engine\.coverageBlindspotRepeatMissCount\s+(\d+)",
+        "coverage_blindspot_distinct_pattern_count": r"matrix_engine\.coverageBlindspotDistinctPatternCount\s+(\d+)",
+        "coverage_blindspot_target_miss_count": r"matrix_engine\.coverageBlindspotTargetMissCount\s+(\d+)",
+        "coverage_blindspot_target_first_seen_miss_count": r"matrix_engine\.coverageBlindspotTargetFirstSeenMissCount\s+(\d+)",
+        "coverage_blindspot_target_repeat_miss_count": r"matrix_engine\.coverageBlindspotTargetRepeatMissCount\s+(\d+)",
+        "coverage_blindspot_target_distinct_pattern_count": r"matrix_engine\.coverageBlindspotTargetDistinctPatternCount\s+(\d+)",
+        "smart_prefetch_a_issue_count": r"matrix_engine\.smartPrefetchAIssueCount\s+(\d+)",
+        "smart_prefetch_a_repeat_priority_count": r"matrix_engine\.smartPrefetchARepeatPriorityCount\s+(\d+)",
+        "smart_prefetch_a_near_multi_priority_count": r"matrix_engine\.smartPrefetchANearMultiPriorityCount\s+(\d+)",
+        "smart_prefetch_b_next_output_priority_issue_count": r"matrix_engine\.smartPrefetchBNextOutputPriorityIssueCount\s+(\d+)",
+        "smart_prefetch_b_next_output_coverage_target_issue_count": r"matrix_engine\.smartPrefetchBNextOutputCoverageTargetIssueCount\s+(\d+)",
+        "smart_prefetch_b_next_k_priority_issue_count": r"matrix_engine\.smartPrefetchBNextKPriorityIssueCount\s+(\d+)",
+        "fallback_autopsy_coverage_normal_immediate_count": r"matrix_engine\.fallbackAutopsyCoverageNormalByDistance::immediate\s+(\d+)",
+        "fallback_autopsy_coverage_normal_near_count": r"matrix_engine\.fallbackAutopsyCoverageNormalByDistance::near\s+(\d+)",
+        "fallback_autopsy_coverage_normal_far_count": r"matrix_engine\.fallbackAutopsyCoverageNormalByDistance::far\s+(\d+)",
+        "coverage_blindspot_seen_distance_immediate_count": r"matrix_engine\.coverageBlindspotSeenByDistance::immediate\s+(\d+)",
+        "coverage_blindspot_seen_distance_near_count": r"matrix_engine\.coverageBlindspotSeenByDistance::near\s+(\d+)",
+        "coverage_blindspot_seen_distance_far_count": r"matrix_engine\.coverageBlindspotSeenByDistance::far\s+(\d+)",
+        "coverage_blindspot_promoted_distance_immediate_count": r"matrix_engine\.coverageBlindspotPromotedByDistance::immediate\s+(\d+)",
+        "coverage_blindspot_promoted_distance_near_count": r"matrix_engine\.coverageBlindspotPromotedByDistance::near\s+(\d+)",
+        "coverage_blindspot_promoted_distance_far_count": r"matrix_engine\.coverageBlindspotPromotedByDistance::far\s+(\d+)",
+        "mhot_hit_on_coverage_blindspot_immediate_count": r"matrix_engine\.mhotHitOnCoverageBlindspotByDistance::immediate\s+(\d+)",
+        "mhot_hit_on_coverage_blindspot_near_count": r"matrix_engine\.mhotHitOnCoverageBlindspotByDistance::near\s+(\d+)",
+        "mhot_hit_on_coverage_blindspot_far_count": r"matrix_engine\.mhotHitOnCoverageBlindspotByDistance::far\s+(\d+)",
+        "coverage_blindspot_seen_reuse_none_count": r"matrix_engine\.coverageBlindspotSeenByReuseBucket::none\s+(\d+)",
+        "coverage_blindspot_seen_reuse_one_count": r"matrix_engine\.coverageBlindspotSeenByReuseBucket::one\s+(\d+)",
+        "coverage_blindspot_seen_reuse_two_to_three_count": r"matrix_engine\.coverageBlindspotSeenByReuseBucket::two_to_three\s+(\d+)",
+        "coverage_blindspot_seen_reuse_four_plus_count": r"matrix_engine\.coverageBlindspotSeenByReuseBucket::four_plus\s+(\d+)",
+        "coverage_blindspot_promoted_reuse_none_count": r"matrix_engine\.coverageBlindspotPromotedByReuseBucket::none\s+(\d+)",
+        "coverage_blindspot_promoted_reuse_one_count": r"matrix_engine\.coverageBlindspotPromotedByReuseBucket::one\s+(\d+)",
+        "coverage_blindspot_promoted_reuse_two_to_three_count": r"matrix_engine\.coverageBlindspotPromotedByReuseBucket::two_to_three\s+(\d+)",
+        "coverage_blindspot_promoted_reuse_four_plus_count": r"matrix_engine\.coverageBlindspotPromotedByReuseBucket::four_plus\s+(\d+)",
+        "coverage_blindspot_seen_tile_lte4_count": r"matrix_engine\.coverageBlindspotSeenByTileBand::lte4\s+(\d+)",
+        "coverage_blindspot_seen_tile_lte12_count": r"matrix_engine\.coverageBlindspotSeenByTileBand::lte12\s+(\d+)",
+        "coverage_blindspot_seen_tile_lte24_count": r"matrix_engine\.coverageBlindspotSeenByTileBand::lte24\s+(\d+)",
+        "coverage_blindspot_seen_tile_gt24_count": r"matrix_engine\.coverageBlindspotSeenByTileBand::gt24\s+(\d+)",
+        "coverage_blindspot_promoted_tile_lte4_count": r"matrix_engine\.coverageBlindspotPromotedByTileBand::lte4\s+(\d+)",
+        "coverage_blindspot_promoted_tile_lte12_count": r"matrix_engine\.coverageBlindspotPromotedByTileBand::lte12\s+(\d+)",
+        "coverage_blindspot_promoted_tile_lte24_count": r"matrix_engine\.coverageBlindspotPromotedByTileBand::lte24\s+(\d+)",
+        "coverage_blindspot_promoted_tile_gt24_count": r"matrix_engine\.coverageBlindspotPromotedByTileBand::gt24\s+(\d+)",
+        "fallback_autopsy_timeliness_count": r"matrix_engine\.fallbackAutopsyTimelinessCount\s+(\d+)",
+        "fallback_autopsy_churn_count": r"matrix_engine\.fallbackAutopsyChurnCount\s+(\d+)",
+        "fallback_autopsy_coverage_count": r"matrix_engine\.fallbackAutopsyCoverageCount\s+(\d+)",
+        "rx_a_issue_count": r"matrix_engine\.rxAIssueCount\s+(\d+)",
+        "rx_b_issue_count": r"matrix_engine\.rxBIssueCount\s+(\d+)",
+        "rx_a_ready_count": r"matrix_engine\.rxAReadyCount\s+(\d+)",
+        "rx_b_ready_count": r"matrix_engine\.rxBReadyCount\s+(\d+)",
+        "rx_a_queue_occupancy_peak": r"matrix_engine\.rxAQueueOccupancyPeak\s+(\d+)",
+        "rx_b_queue_occupancy_peak": r"matrix_engine\.rxBQueueOccupancyPeak\s+(\d+)",
+        "rx_a_stall_cycles": r"matrix_engine\.rxAStallCycles\s+(\d+)",
+        "rx_b_stall_cycles": r"matrix_engine\.rxBStallCycles\s+(\d+)",
+        "rx_a_priority_wins": r"matrix_engine\.rxAPriorityWins\s+(\d+)",
+        "rx_b_priority_wins": r"matrix_engine\.rxBPriorityWins\s+(\d+)",
+        "rx_b_deficit_wins": r"matrix_engine\.rxBDeficitWins\s+(\d+)",
+        "rx_a_deficit_wins": r"matrix_engine\.rxADeficitWins\s+(\d+)",
+        "rx_b_deadline_wins": r"matrix_engine\.rxBDeadlineWins\s+(\d+)",
+        "rx_a_deadline_wins": r"matrix_engine\.rxADeadlineWins\s+(\d+)",
     }
     text = open(stats_file, encoding="utf-8", errors="ignore").read()
     for key, pattern in patterns.items():
         matches = re.findall(pattern, text)
         if matches:
-            stats[key] = int(matches[-1])
+            last = matches[-1]
+            stats[key] = float(last) if "." in last else int(last)
     return stats
 
 
@@ -479,7 +1805,15 @@ def serial_log_has_benchmark(serial_log_file):
 def write_partial_results(results):
     if not results:
         return
-    headers = results[0].keys()
+
+    headers = []
+    seen = set()
+    for row in results:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                headers.append(key)
+
     with open(CSV_FILE, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
@@ -490,9 +1824,38 @@ def write_partial_results(results):
             f.write(str(r) + "\n")
 
 
+def load_existing_results():
+    if not os.path.exists(CSV_FILE) or os.path.getsize(CSV_FILE) == 0:
+        return []
+
+    with open(CSV_FILE, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def completed_case_keys(results):
+    keys = set()
+    for row in results:
+        preset = row.get("Preset")
+        label = row.get("Prefetch Label")
+        if preset and label:
+            keys.add((preset, label))
+    return keys
+
+
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    results = []
+    if FORCE_RERUN:
+        results = []
+        completed_cases = set()
+    else:
+        results = load_existing_results()
+        completed_cases = completed_case_keys(results)
+    active_presets = [
+        preset for preset in PRESETS if preset["name"] in RUN_ONLY_PRESET_NAMES
+    ]
+    active_cfgs = [
+        cfg for cfg in PREFETCH_CONFIGS if cfg["label"] in RUN_ONLY_LABELS
+    ]
 
     print("🚀 启动 ViT-inspired Layer Proxy Sweep")
     print("   架构: CXL Type-3 + 设备侧 DDR5 HDM + device-side MatrixFlow")
@@ -502,7 +1865,7 @@ def main():
         + ", ".join(
             f"{preset['name']}[S={preset['seq_len']},H={preset['hidden_dim']},"
             f"M={preset['mlp_dim']},heads={preset['num_heads']}]"
-            for preset in PRESETS
+            for preset in active_presets
         )
     )
     print(
@@ -513,24 +1876,41 @@ def main():
             f"carryMax={cfg.get('carry_over_max_rows', 0)},"
             f"carryInflight={cfg.get('carry_over_inherit_inflight', 0)},"
             f"holeLead={cfg.get('hole_fill_lead_rows', 0)},"
-            f"writeCBudget={cfg.get('writec_overlap_b_issue_budget_rows', 0)}]"
-            for cfg in PREFETCH_CONFIGS
+            f"vipRows={cfg.get('vip_b_rows_capacity', 0)},"
+            f"mhotRows={cfg.get('mhot_b_rows_capacity', 0)},"
+            f"shadowRows={cfg.get('coverage_shadow_rows_capacity', 0)},"
+            f"writeCBudget={cfg.get('writec_overlap_b_issue_budget_rows', 0)},"
+            f"scheduler={cfg.get('ab_scheduler_mode', 'baseline')},"
+            f"curQuota={cfg.get('ab_current_protected_b_quota_rows', 4)}]"
+            for cfg in active_cfgs
         )
     )
     print("=" * 50)
+    if FORCE_RERUN:
+        print("[*] FORCE_RERUN=1，本轮忽略已有 roofline_data.csv，重新全量跑当前筛选点")
 
     ensure_libm5()
 
     for cfg in PREFETCH_CONFIGS:
+        if cfg["label"] not in RUN_ONLY_LABELS:
+            print(f"[-] 跳过配置: {cfg['label']}")
+            continue
         print(
             f"\n=== 预取配置: {cfg['label']} "
             f"(mode={cfg['mode']}, trigger={cfg['trigger']}, "
             f"rowsA={cfg['rows_a']}, rowsB={cfg['rows_b']}) ==="
         )
         for preset in PRESETS:
+            if not should_run_case(preset, cfg):
+                print(f"[-] 跳过预设: {preset['name']} / 配置: {cfg['label']}")
+                continue
             rows_b = cfg.get("rows_b_by_preset", {}).get(
                 preset["name"], cfg["rows_b"]
             )
+            case_key = (preset["name"], cfg["label"])
+            if case_key in completed_cases:
+                print(f"[-] 跳过已完成点: {preset['name']} / 配置: {cfg['label']}")
+                continue
             preset_tag = preset["name"].replace(" ", "_").replace("/", "_")
             run_tag = f"{preset_tag}__{cfg['label']}"
             seq_len = preset["seq_len"]
@@ -564,6 +1944,44 @@ def main():
             )
             env["MATRIXFLOW_WRITEC_OVERLAP_B_ISSUE_BUDGET_ROWS"] = str(
                 cfg.get("writec_overlap_b_issue_budget_rows", 0)
+            )
+            env["MATRIXFLOW_VIP_B_ROWS_CAPACITY"] = str(
+                cfg.get("vip_b_rows_capacity", 0)
+            )
+            env["MATRIXFLOW_MHOT_B_ROWS_CAPACITY"] = str(
+                cfg.get("mhot_b_rows_capacity", 0)
+            )
+            env["MATRIXFLOW_COVERAGE_SHADOW_ROWS_CAPACITY"] = str(
+                cfg.get("coverage_shadow_rows_capacity", 0)
+            )
+            env["MATRIXFLOW_COVERAGE_GATHER_MIN_ISSUE_BUDGET"] = str(
+                cfg.get("coverage_gather_min_issue_budget", 0)
+            )
+            env["MATRIXFLOW_AB_SCHEDULER_MODE"] = cfg.get(
+                "ab_scheduler_mode", "baseline"
+            )
+            env["MATRIXFLOW_AB_A_MIN_CREDIT_ROWS"] = str(
+                cfg.get("ab_a_min_credit_rows", 16)
+            )
+            env["MATRIXFLOW_AB_B_BIAS"] = str(cfg.get("ab_bias_b", 1))
+            env["MATRIXFLOW_AB_W_URGENCY"] = str(
+                cfg.get("ab_weight_urgency", 4)
+            )
+            env["MATRIXFLOW_AB_W_DEFICIT"] = str(
+                cfg.get("ab_weight_deficit", 3)
+            )
+            env["MATRIXFLOW_AB_W_REUSE"] = str(cfg.get("ab_weight_reuse", 1))
+            env["MATRIXFLOW_AB_W_FALLBACK_RISK"] = str(
+                cfg.get("ab_weight_fallback_risk", 2)
+            )
+            env["MATRIXFLOW_AB_MIN_LAUNCH_ROWS_A"] = str(
+                cfg.get("ab_min_launch_rows_a", 0)
+            )
+            env["MATRIXFLOW_AB_MIN_LAUNCH_ROWS_B"] = str(
+                cfg.get("ab_min_launch_rows_b", 0)
+            )
+            env["MATRIXFLOW_AB_CURRENT_PROTECTED_B_QUOTA_ROWS"] = str(
+                cfg.get("ab_current_protected_b_quota_rows", 4)
             )
 
             metrics = None
@@ -709,6 +2127,23 @@ def main():
                 "Prefetch Trigger": cfg["trigger"],
                 "Prefetch Rows A": cfg["rows_a"],
                 "Prefetch Rows B": rows_b,
+                "Scheduler Mode": cfg.get("ab_scheduler_mode", "baseline"),
+                "A Min Credit Rows": cfg.get("ab_a_min_credit_rows", 16),
+                "B Bias": cfg.get("ab_bias_b", 1),
+                "Score W Urgency": cfg.get("ab_weight_urgency", 4),
+                "Score W Deficit": cfg.get("ab_weight_deficit", 3),
+                "Score W Reuse": cfg.get("ab_weight_reuse", 1),
+                "Score W Fallback Risk": cfg.get("ab_weight_fallback_risk", 2),
+                "Min Launch Rows A": cfg.get("ab_min_launch_rows_a", 0),
+                "Min Launch Rows B": cfg.get("ab_min_launch_rows_b", 0),
+                "Current Protected B Quota": cfg.get(
+                    "ab_current_protected_b_quota_rows", 4
+                ),
+                "VIP B Rows Capacity": cfg.get("vip_b_rows_capacity", 0),
+                "MHot B Rows Capacity": cfg.get("mhot_b_rows_capacity", 0),
+                "Coverage Shadow Rows Capacity": cfg.get(
+                    "coverage_shadow_rows_capacity", 0
+                ),
                 "SeqLen": preset["seq_len"],
                 "HiddenDim": preset["hidden_dim"],
                 "MLPDim": preset["mlp_dim"],
@@ -845,6 +2280,320 @@ def main():
                 "writec_blocked_b_issue_count": prefetch[
                     "writec_blocked_b_issue_count"
                 ],
+                "a_rows_issued": prefetch["a_rows_issued"],
+                "a_rows_ready_before_compute": prefetch[
+                    "a_rows_ready_before_compute"
+                ],
+                "a_rows_inflight_peak": prefetch["a_rows_inflight_peak"],
+                "b_rows_inflight_peak": prefetch["b_rows_inflight_peak"],
+                "ab_parallel_fetch_overlap_cycles": prefetch[
+                    "ab_parallel_fetch_overlap_cycles"
+                ],
+                "a_fetch_progress_during_b_fetch": prefetch[
+                    "a_fetch_progress_during_b_fetch"
+                ],
+                "b_fetch_progress_during_a_fetch": prefetch[
+                    "b_fetch_progress_during_a_fetch"
+                ],
+                "a_path_stall_waiting_for_b": prefetch[
+                    "a_path_stall_waiting_for_b"
+                ],
+                "b_path_stall_waiting_for_a": prefetch[
+                    "b_path_stall_waiting_for_a"
+                ],
+                "a_credit_floor_hits": prefetch["a_credit_floor_hits"],
+                "b_bias_wins": prefetch["b_bias_wins"],
+                "urgency_priority_wins": prefetch["urgency_priority_wins"],
+                "deficit_priority_wins": prefetch["deficit_priority_wins"],
+                "reuse_priority_wins": prefetch["reuse_priority_wins"],
+                "fallback_risk_priority_wins": prefetch[
+                    "fallback_risk_priority_wins"
+                ],
+                "score_tie_break_count": prefetch["score_tie_break_count"],
+                "avg_score_A": round(float(prefetch["avg_score_a"]), 4),
+                "avg_score_B": round(float(prefetch["avg_score_b"]), 4),
+                "max_score_A": round(float(prefetch["max_score_a"]), 4),
+                "max_score_B": round(float(prefetch["max_score_b"]), 4),
+                "protected_b_issue_count": prefetch["protected_b_issue_count"],
+                "protected_b_ready_count": prefetch["protected_b_ready_count"],
+                "protected_b_priority_wins": prefetch[
+                    "protected_b_priority_wins"
+                ],
+                "protected_b_blocks_a_count": prefetch[
+                    "protected_b_blocks_a_count"
+                ],
+                "protected_b_blocks_normal_b_count": prefetch[
+                    "protected_b_blocks_normal_b_count"
+                ],
+                "protected_b_from_carry_over_count": prefetch[
+                    "protected_b_from_carry_over_count"
+                ],
+                "protected_b_from_next_output_count": prefetch[
+                    "protected_b_from_next_output_count"
+                ],
+                "protected_b_from_hole_filling_count": prefetch[
+                    "protected_b_from_hole_filling_count"
+                ],
+                "protected_b_from_compute_window_count": prefetch[
+                    "protected_b_from_compute_window_count"
+                ],
+                "future_protected_b_issue_count": prefetch[
+                    "future_protected_b_issue_count"
+                ],
+                "future_protected_b_priority_wins": prefetch[
+                    "future_protected_b_priority_wins"
+                ],
+                "future_protected_b_blocks_a_count": prefetch[
+                    "future_protected_b_blocks_a_count"
+                ],
+                "future_protected_b_blocks_current_b_count": prefetch[
+                    "future_protected_b_blocks_current_b_count"
+                ],
+                "future_protected_b_from_next_output_count": prefetch[
+                    "future_protected_b_from_next_output_count"
+                ],
+                "future_protected_b_from_future_hole_filling_count": prefetch[
+                    "future_protected_b_from_future_hole_filling_count"
+                ],
+                "future_protected_b_ready_at_boundary_count": prefetch[
+                    "future_protected_b_ready_at_boundary_count"
+                ],
+                "current_protected_b_issue_count": prefetch[
+                    "current_protected_b_issue_count"
+                ],
+                "current_protected_b_priority_wins": prefetch[
+                    "current_protected_b_priority_wins"
+                ],
+                "current_protected_b_blocks_a_count": prefetch[
+                    "current_protected_b_blocks_a_count"
+                ],
+                "current_protected_b_quota_exhaust_count": prefetch[
+                    "current_protected_b_quota_exhaust_count"
+                ],
+                "current_protected_b_from_compute_window_count": prefetch[
+                    "current_protected_b_from_compute_window_count"
+                ],
+                "current_protected_b_from_current_hole_filling_count": prefetch[
+                    "current_protected_b_from_current_hole_filling_count"
+                ],
+                "b_rows_claimed_by_future": prefetch[
+                    "b_rows_claimed_by_future"
+                ],
+                "future_claim_set_count": prefetch["future_claim_set_count"],
+                "future_claim_cleared_count": prefetch[
+                    "future_claim_cleared_count"
+                ],
+                "future_claim_blocked_normal_fetch_count": prefetch[
+                    "future_claim_blocked_normal_fetch_count"
+                ],
+                "future_claim_expired_count": prefetch[
+                    "future_claim_expired_count"
+                ],
+                "future_claim_consumed_success_count": prefetch[
+                    "future_claim_consumed_success_count"
+                ],
+                "future_claim_invalidated_count": prefetch[
+                    "future_claim_invalidated_count"
+                ],
+                "vip_pool_capacity": prefetch["vip_pool_capacity"],
+                "vip_pool_occupancy_peak": prefetch["vip_pool_occupancy_peak"],
+                "vip_insert_count": prefetch["vip_insert_count"],
+                "vip_hit_count": prefetch["vip_hit_count"],
+                "vip_miss_count": prefetch["vip_miss_count"],
+                "vip_eviction_count": prefetch["vip_eviction_count"],
+                "vip_hit_on_next_output_count": prefetch[
+                    "vip_hit_on_next_output_count"
+                ],
+                "vip_hit_on_next_output_immediate_count": prefetch[
+                    "vip_hit_on_next_output_immediate_count"
+                ],
+                "vip_hit_on_next_output_near_count": prefetch[
+                    "vip_hit_on_next_output_near_count"
+                ],
+                "vip_hit_on_claimed_future_b_count": prefetch[
+                    "vip_hit_on_claimed_future_b_count"
+                ],
+                "vip_hit_on_carry_over_b_count": prefetch[
+                    "vip_hit_on_carry_over_b_count"
+                ],
+                "vip_insert_from_next_output_count": prefetch[
+                    "vip_insert_from_next_output_count"
+                ],
+                "vip_insert_from_claim_count": prefetch[
+                    "vip_insert_from_claim_count"
+                ],
+                "vip_insert_from_carry_over_count": prefetch[
+                    "vip_insert_from_carry_over_count"
+                ],
+                "vip_materialize_to_current_count": prefetch[
+                    "vip_materialize_to_current_count"
+                ],
+                "vip_b_rows_served_to_compute": prefetch[
+                    "vip_b_rows_served_to_compute"
+                ],
+                "vip_b_rows_prevented_fallback_count": prefetch[
+                    "vip_b_rows_prevented_fallback_count"
+                ],
+                "vip_strong_admit_count": prefetch["vip_strong_admit_count"],
+                "vip_weak_admit_count": prefetch["vip_weak_admit_count"],
+                "vip_evict_low_priority_count": prefetch[
+                    "vip_evict_low_priority_count"
+                ],
+                "vip_evict_weak_admit_count": prefetch[
+                    "vip_evict_weak_admit_count"
+                ],
+                "vip_evict_normal_count": prefetch["vip_evict_normal_count"],
+                "vip_admit_next_output_immediate_count": prefetch[
+                    "vip_admit_next_output_immediate_count"
+                ],
+                "vip_admit_next_output_near_count": prefetch[
+                    "vip_admit_next_output_near_count"
+                ],
+                "vip_admit_next_output_far_count": prefetch[
+                    "vip_admit_next_output_far_count"
+                ],
+                "vip_admit_claim_count": prefetch["vip_admit_claim_count"],
+                "vip_admit_carry_over_count": prefetch[
+                    "vip_admit_carry_over_count"
+                ],
+                "vip_admit_current_window_immediate_count": prefetch[
+                    "vip_admit_current_window_immediate_count"
+                ],
+                "vip_reject_normal_near_count": prefetch[
+                    "vip_reject_normal_near_count"
+                ],
+                "vip_reject_normal_far_count": prefetch[
+                    "vip_reject_normal_far_count"
+                ],
+                "vip_reject_other_count": prefetch["vip_reject_other_count"],
+                "oracle_selected_b_rows_count": prefetch[
+                    "oracle_selected_b_rows_count"
+                ],
+                "oracle_selected_rows_served_by_vip_count": prefetch[
+                    "oracle_selected_rows_served_by_vip_count"
+                ],
+                "oracle_selected_rows_missed_by_vip_count": prefetch[
+                    "oracle_selected_rows_missed_by_vip_count"
+                ],
+                "vip_rescue_insert_count": prefetch["vip_rescue_insert_count"],
+                "vip_rescue_hit_count": prefetch["vip_rescue_hit_count"],
+                "vip_rescue_miss_count": prefetch["vip_rescue_miss_count"],
+                "vip_rescue_eviction_count": prefetch[
+                    "vip_rescue_eviction_count"
+                ],
+                "vip_rescue_served_to_compute_count": prefetch[
+                    "vip_rescue_served_to_compute_count"
+                ],
+                "vip_rescue_prevented_fallback_count": prefetch[
+                    "vip_rescue_prevented_fallback_count"
+                ],
+                "vip_rescue_insert_after_fallback_count": prefetch[
+                    "vip_rescue_insert_after_fallback_count"
+                ],
+                "vip_rescue_insert_short_next_use_count": prefetch[
+                    "vip_rescue_insert_short_next_use_count"
+                ],
+                "vip_rescue_insert_multi_future_use_count": prefetch[
+                    "vip_rescue_insert_multi_future_use_count"
+                ],
+                "vip_rescue_reused_count": prefetch["vip_rescue_reused_count"],
+                "vip_rescue_a_insert_count": prefetch[
+                    "vip_rescue_a_insert_count"
+                ],
+                "vip_rescue_a_hit_count": prefetch["vip_rescue_a_hit_count"],
+                "vip_rescue_a_miss_count": prefetch["vip_rescue_a_miss_count"],
+                "vip_rescue_a_eviction_count": prefetch[
+                    "vip_rescue_a_eviction_count"
+                ],
+                "vip_rescue_a_served_to_compute_count": prefetch[
+                    "vip_rescue_a_served_to_compute_count"
+                ],
+                "vip_rescue_a_prevented_remote_fetch_count": prefetch[
+                    "vip_rescue_a_prevented_remote_fetch_count"
+                ],
+                "vip_rescue_a_insert_short_next_use_count": prefetch[
+                    "vip_rescue_a_insert_short_next_use_count"
+                ],
+                "vip_rescue_a_insert_multi_future_use_count": prefetch[
+                    "vip_rescue_a_insert_multi_future_use_count"
+                ],
+                "vip_rescue_a_reused_count": prefetch[
+                    "vip_rescue_a_reused_count"
+                ],
+                "mhot_pool_capacity": prefetch["mhot_pool_capacity"],
+                "mhot_occupancy_peak": prefetch["mhot_occupancy_peak"],
+                "mhot_insert_count": prefetch["mhot_insert_count"],
+                "mhot_insert_default_count": prefetch[
+                    "mhot_insert_default_count"
+                ],
+                "mhot_insert_enhanced_count": prefetch[
+                    "mhot_insert_enhanced_count"
+                ],
+                "mhot_insert_next_output_immediate_count": prefetch[
+                    "mhot_insert_next_output_immediate_count"
+                ],
+                "mhot_insert_next_output_near_count": prefetch[
+                    "mhot_insert_next_output_near_count"
+                ],
+                "mhot_insert_next_output_far_count": prefetch[
+                    "mhot_insert_next_output_far_count"
+                ],
+                "mhot_insert_claim_count": prefetch["mhot_insert_claim_count"],
+                "mhot_insert_carry_over_count": prefetch[
+                    "mhot_insert_carry_over_count"
+                ],
+                "mhot_hit_count": prefetch["mhot_hit_count"],
+                "mhot_hit_on_next_output_immediate_count": prefetch[
+                    "mhot_hit_on_next_output_immediate_count"
+                ],
+                "mhot_hit_on_next_output_near_count": prefetch[
+                    "mhot_hit_on_next_output_near_count"
+                ],
+                "mhot_hit_on_next_output_far_count": prefetch[
+                    "mhot_hit_on_next_output_far_count"
+                ],
+                "mhot_hit_on_claim_count": prefetch["mhot_hit_on_claim_count"],
+                "mhot_hit_on_carry_over_count": prefetch[
+                    "mhot_hit_on_carry_over_count"
+                ],
+                "mhot_rows_served_to_compute_count": prefetch[
+                    "mhot_rows_served_to_compute_count"
+                ],
+                "mhot_materialize_to_current_count": prefetch[
+                    "mhot_materialize_to_current_count"
+                ],
+                "mhot_eviction_count": prefetch["mhot_eviction_count"],
+                "mhot_reuse_hit_count": prefetch["mhot_reuse_hit_count"],
+                "mhot_mainline_prevented_remote_count": prefetch[
+                    "mhot_mainline_prevented_remote_count"
+                ],
+                "mhot_checked_on_fallback_count": prefetch[
+                    "mhot_checked_on_fallback_count"
+                ],
+                "mhot_miss_then_remote_count": prefetch[
+                    "mhot_miss_then_remote_count"
+                ],
+                "mhot_hit_before_remote_count": prefetch[
+                    "mhot_hit_before_remote_count"
+                ],
+                "rx_a_issue_count": prefetch["rx_a_issue_count"],
+                "rx_b_issue_count": prefetch["rx_b_issue_count"],
+                "rx_a_ready_count": prefetch["rx_a_ready_count"],
+                "rx_b_ready_count": prefetch["rx_b_ready_count"],
+                "rx_a_queue_occupancy_peak": prefetch[
+                    "rx_a_queue_occupancy_peak"
+                ],
+                "rx_b_queue_occupancy_peak": prefetch[
+                    "rx_b_queue_occupancy_peak"
+                ],
+                "rx_a_stall_cycles": prefetch["rx_a_stall_cycles"],
+                "rx_b_stall_cycles": prefetch["rx_b_stall_cycles"],
+                "rx_a_priority_wins": prefetch["rx_a_priority_wins"],
+                "rx_b_priority_wins": prefetch["rx_b_priority_wins"],
+                "rx_b_deficit_wins": prefetch["rx_b_deficit_wins"],
+                "rx_a_deficit_wins": prefetch["rx_a_deficit_wins"],
+                "rx_b_deadline_wins": prefetch["rx_b_deadline_wins"],
+                "rx_a_deadline_wins": prefetch["rx_a_deadline_wins"],
                 "Raw DMA Action Histogram": formation["raw_hist"],
                 "Raw DMA Action Count": formation["raw_count"],
                 "Raw DMA Action Bytes": formation["raw_bytes"],
@@ -955,6 +2704,7 @@ def main():
                 ),
             }
             results.append(result_row)
+            completed_cases.add(case_key)
 
             print(
                 f"[√] {preset['name']} / {cfg['label']} 完成! "

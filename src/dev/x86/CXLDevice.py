@@ -60,6 +60,37 @@ class CXLMemCtrl(PciDevice):
             writec_overlap_b_issue_budget_rows=int(
                 os.getenv("MATRIXFLOW_WRITEC_OVERLAP_B_ISSUE_BUDGET_ROWS", "0")
             ),
+            vip_b_rows_capacity=int(
+                os.getenv("MATRIXFLOW_VIP_B_ROWS_CAPACITY", "0")
+            ),
+            mhot_b_rows_capacity=int(
+                os.getenv("MATRIXFLOW_MHOT_B_ROWS_CAPACITY", "0")
+            ),
+            coverage_shadow_rows_capacity=int(
+                os.getenv("MATRIXFLOW_COVERAGE_SHADOW_ROWS_CAPACITY", "0")
+            ),
+            coverage_gather_min_issue_budget=int(
+                os.getenv("MATRIXFLOW_COVERAGE_GATHER_MIN_ISSUE_BUDGET", "0")
+            ),
+            ab_scheduler_mode=os.getenv(
+                "MATRIXFLOW_AB_SCHEDULER_MODE", "baseline"
+            ),
+            ab_a_min_credit_rows=int(
+                os.getenv("MATRIXFLOW_AB_A_MIN_CREDIT_ROWS", "16")
+            ),
+            ab_bias_b=int(os.getenv("MATRIXFLOW_AB_B_BIAS", "1")),
+            ab_weight_urgency=int(os.getenv("MATRIXFLOW_AB_W_URGENCY", "4")),
+            ab_weight_deficit=int(os.getenv("MATRIXFLOW_AB_W_DEFICIT", "3")),
+            ab_weight_reuse=int(os.getenv("MATRIXFLOW_AB_W_REUSE", "1")),
+            ab_weight_fallback_risk=int(
+                os.getenv("MATRIXFLOW_AB_W_FALLBACK_RISK", "2")
+            ),
+            ab_min_launch_rows_a=int(
+                os.getenv("MATRIXFLOW_AB_MIN_LAUNCH_ROWS_A", "0")
+            ),
+            ab_min_launch_rows_b=int(
+                os.getenv("MATRIXFLOW_AB_MIN_LAUNCH_ROWS_B", "0")
+            ),
         ),
         "MatrixFlow compute engine (PNM accelerator)",
     )

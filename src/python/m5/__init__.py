@@ -40,13 +40,55 @@ except ImportError:
     in_gem5 = False
 
 if not in_gem5:
+    import collections
     import os
+    import sys
+    import types
+
+    def _config_bool(name, default=False):
+        config_root = ""
+        if extra_pkg_root:
+            config_root = os.path.abspath(
+                os.path.join(extra_pkg_root, "..", "config")
+            )
+        header_path = (
+            os.path.join(config_root, f"{name.lower()}.hh")
+            if config_root
+            else ""
+        )
+        if header_path and os.path.exists(header_path):
+            try:
+                with open(header_path, encoding="utf-8") as header_file:
+                    text = header_file.read()
+                if f"#define {name} 1" in text:
+                    return True
+                if f"#define {name} 0" in text:
+                    return False
+            except OSError:
+                pass
+        return default
 
     extra_pkg_root = os.environ.get("M5_BUILD_PYTHON_DIR", "")
     if extra_pkg_root:
         extra_m5_dir = os.path.join(extra_pkg_root, "m5")
         if os.path.isdir(extra_m5_dir) and extra_m5_dir not in __path__:
             __path__.append(extra_m5_dir)
+
+    if "m5.defines" not in sys.modules:
+        defines_module = types.ModuleType("m5.defines")
+        fallback_build_env = collections.defaultdict(lambda: False)
+        fallback_build_env.update(
+            {
+                "BUILD_ISA": os.environ.get("M5_BUILD_ISA", "X86"),
+                "TARGET_ISA": os.environ.get("M5_TARGET_ISA", "x86"),
+                "PROTOCOL": os.environ.get("M5_PROTOCOL", "MI_example"),
+                "USE_SYSTEMC": False,
+                "HAVE_TUNTAP": _config_bool("HAVE_TUNTAP", False),
+                "HAVE_PROTOBUF": _config_bool("HAVE_PROTOBUF", False),
+            }
+        )
+        defines_module.buildEnv = fallback_build_env
+        sys.modules["m5.defines"] = defines_module
 
 if in_gem5:
     from . import (
