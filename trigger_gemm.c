@@ -26,6 +26,11 @@ enum Phase2Mode {
     MODE_STAGED_BLOCK = 1,
 };
 
+enum WorkloadMode {
+    WORKLOAD_VIT_PROXY = 0,
+    WORKLOAD_PURE_GEMM = 1,
+};
+
 struct VitProxyConfig {
     const char *preset_name;
     uint32_t seq_len;
@@ -183,6 +188,15 @@ calc_tile_count(uint32_t n, uint32_t tile_dim)
 {
     uint64_t per_dim = (n + tile_dim - 1U) / tile_dim;
     return per_dim * per_dim * per_dim;
+}
+
+static enum WorkloadMode
+parse_workload_mode(const char *name)
+{
+    if (name != NULL && strcmp(name, "pure_gemm") == 0) {
+        return WORKLOAD_PURE_GEMM;
+    }
+    return WORKLOAD_VIT_PROXY;
 }
 
 static void
@@ -532,6 +546,7 @@ main(int argc, char *argv[])
     uint32_t default_mlp_dim = 4096;
     uint32_t default_num_heads = 16;
     const char *default_phase2_mode = "staged_block";
+    const char *default_workload = "vit_proxy";
     uint32_t default_staged_block_bytes = 1024;
 
     if (argc >= 2) {
@@ -540,10 +555,13 @@ main(int argc, char *argv[])
     if (argc >= 3) {
         default_seq_len = (uint32_t)strtoul(argv[2], NULL, 0);
     }
+    if (argc >= 4) {
+        default_workload = argv[3];
+    }
 
     {
         struct VitProxyConfig cfg = {
-            .preset_name = "ViT-Large-like",
+            .preset_name = "MatrixFlow-Benchmark",
             .seq_len = default_seq_len,
             .hidden_dim = default_hidden_dim,
             .mlp_dim = default_mlp_dim,
@@ -551,10 +569,15 @@ main(int argc, char *argv[])
             .phase2_mode_name = default_phase2_mode,
             .staged_block_bytes = default_staged_block_bytes,
         };
+        enum WorkloadMode workload_mode = parse_workload_mode(default_workload);
         enum Phase2Mode phase2_mode =
             strcmp(cfg.phase2_mode_name, "remote_scalar") == 0
                 ? MODE_REMOTE_SCALAR
                 : MODE_STAGED_BLOCK;
+        const int run_phase2 = workload_mode == WORKLOAD_VIT_PROXY;
+        const int run_phase3 = workload_mode == WORKLOAD_VIT_PROXY;
+        const char *workload_name = run_phase2 ? "vit_proxy" : "pure_gemm";
+        const uint32_t descriptor_launch_count = run_phase3 ? 2U : 1U;
 
         const uint32_t matrix_size = cfg.seq_len;
         const unsigned long long doorbell_pa = cxl_base + 0x10000ULL;
@@ -567,20 +590,28 @@ main(int argc, char *argv[])
             align_up_ull(hdm_base + 0x1000ULL, 64ULL);
         const size_t score_elems = (size_t)cfg.seq_len * (size_t)cfg.seq_len;
         const size_t score_bytes = score_elems * sizeof(uint32_t);
-        const size_t hidden_elems = (size_t)cfg.seq_len * (size_t)cfg.hidden_dim;
+        const size_t hidden_elems = run_phase2
+            ? (size_t)cfg.seq_len * (size_t)cfg.hidden_dim
+            : 0;
         const size_t hidden_bytes = hidden_elems * sizeof(uint32_t);
         const size_t hidden_span = (size_t)align_up_ull(hidden_bytes, 64ULL);
-        const size_t mlp_elems = (size_t)cfg.seq_len * (size_t)cfg.mlp_dim;
+        const size_t mlp_elems = run_phase2
+            ? (size_t)cfg.seq_len * (size_t)cfg.mlp_dim
+            : 0;
         const size_t mlp_bytes = mlp_elems * sizeof(uint32_t);
         const size_t mlp_span = (size_t)align_up_ull(mlp_bytes, 64ULL);
-        const size_t total_data_span =
-            (size_t)(matrix_span * 3ULL) + hidden_span + hidden_span + mlp_span;
+        const size_t total_data_span = run_phase2
+            ? (size_t)(matrix_span * 3ULL) + hidden_span + hidden_span +
+                mlp_span
+            : (size_t)(matrix_span * 3ULL);
         const size_t map_size = 4096;
         const uint32_t block_elems =
             cfg.staged_block_bytes / sizeof(uint32_t) > 0
                 ? cfg.staged_block_bytes / sizeof(uint32_t)
                 : 1;
         const uint64_t tile_count_per_gemm = calc_tile_count(cfg.seq_len, 128);
+        const uint64_t total_gemm_count = run_phase3 ? 2ULL : 1ULL;
+        const uint64_t total_tile_count = tile_count_per_gemm * total_gemm_count;
 
         struct Descriptor desc = {
             .addrA = matrix_base,
@@ -641,11 +672,11 @@ main(int argc, char *argv[])
         double phase3_ms;
 
         setbuf(stdout, NULL);
-        printf("========== ViT-inspired Layer Proxy Benchmark ==========\n");
-        printf("[Config] preset=%s seq_len=%u hidden_dim=%u mlp_dim=%u num_heads=%u\n",
-               cfg.preset_name, cfg.seq_len, cfg.hidden_dim, cfg.mlp_dim,
+        printf("========== MatrixFlow Benchmark ==========\n");
+        printf("[Config] workload=%s seq_len=%u hidden_dim=%u mlp_dim=%u num_heads=%u\n",
+               workload_name, cfg.seq_len, cfg.hidden_dim, cfg.mlp_dim,
                cfg.num_heads);
-        printf("[Config] GEMM proxy size=%u x %u, CXL Type-3 + device-side DDR5 HDM\n",
+        printf("[Config] matrix_size=%u x %u, CXL Type-3 + device-side DDR5 HDM\n",
                matrix_size, matrix_size);
         printf("[Config] phase2_mode=%s staged_block_bytes=%u\n",
                cfg.phase2_mode_name, cfg.staged_block_bytes);
@@ -693,27 +724,29 @@ main(int argc, char *argv[])
         residual_buf = (volatile uint32_t *)((char *)hidden_buf + hidden_span);
         mlp_buf = (volatile uint32_t *)((char *)residual_buf + hidden_span);
 
-        if (posix_memalign((void **)&score_row, 64,
-                           cfg.seq_len * sizeof(float)) != 0 ||
-            posix_memalign((void **)&hidden_row, 64,
-                           cfg.hidden_dim * sizeof(float)) != 0 ||
-            posix_memalign((void **)&hidden_block, 64,
-                           block_elems * sizeof(float)) != 0 ||
-            posix_memalign((void **)&residual_block, 64,
-                           block_elems * sizeof(float)) != 0 ||
-            posix_memalign((void **)&mlp_block, 64,
-                           block_elems * sizeof(float)) != 0) {
-            perror("posix_memalign scratch buffers");
-            free(mlp_block);
-            free(residual_block);
-            free(hidden_block);
-            free(hidden_row);
-            free(score_row);
-            munmap(data_map, total_data_span);
-            munmap(doorbell_map, map_size);
-            munmap(desc_map, map_size);
-            close(fd);
-            return -1;
+        if (run_phase2) {
+            if (posix_memalign((void **)&score_row, 64,
+                               cfg.seq_len * sizeof(float)) != 0 ||
+                posix_memalign((void **)&hidden_row, 64,
+                               cfg.hidden_dim * sizeof(float)) != 0 ||
+                posix_memalign((void **)&hidden_block, 64,
+                               block_elems * sizeof(float)) != 0 ||
+                posix_memalign((void **)&residual_block, 64,
+                               block_elems * sizeof(float)) != 0 ||
+                posix_memalign((void **)&mlp_block, 64,
+                               block_elems * sizeof(float)) != 0) {
+                perror("posix_memalign scratch buffers");
+                free(mlp_block);
+                free(residual_block);
+                free(hidden_block);
+                free(hidden_row);
+                free(score_row);
+                munmap(data_map, total_data_span);
+                munmap(doorbell_map, map_size);
+                munmap(desc_map, map_size);
+                close(fd);
+                return -1;
+            }
         }
 
         {
@@ -751,103 +784,141 @@ main(int argc, char *argv[])
         phase1_end = now_sim_ns();
         printf("[Phase 1] done\n");
 
-        phase2_begin = now_sim_ns();
-        printf("[Phase 2] mode=%s over CXL HDM...\n", cfg.phase2_mode_name);
+        phase2_begin = phase1_end;
+        softmax_begin = phase1_end;
+        softmax_end = phase1_end;
+        expand_begin = phase1_end;
+        expand_end = phase1_end;
+        layernorm_begin = phase1_end;
+        layernorm_end = phase1_end;
+        project_begin = phase1_end;
+        project_end = phase1_end;
+        gelu_begin = phase1_end;
+        gelu_end = phase1_end;
+        residual_begin = phase1_end;
+        residual_end = phase1_end;
+        compact_begin = phase1_end;
+        compact_end = phase1_end;
+        phase2_end = phase1_end;
 
-        softmax_begin = now_sim_ns();
-        if (phase2_mode == MODE_STAGED_BLOCK) {
-            phase2_softmax_staged(score_buf, cfg.seq_len, score_row, &score_stats);
+        if (run_phase2) {
+            phase2_begin = now_sim_ns();
+            printf("[Phase 2] mode=%s over CXL HDM...\n", cfg.phase2_mode_name);
+
+            softmax_begin = now_sim_ns();
+            if (phase2_mode == MODE_STAGED_BLOCK) {
+                phase2_softmax_staged(score_buf, cfg.seq_len, score_row,
+                                      &score_stats);
+            } else {
+                phase2_softmax_scalar(score_buf, cfg.seq_len, score_row,
+                                      &score_stats);
+            }
+            softmax_end = now_sim_ns();
+
+            expand_begin = now_sim_ns();
+            if (phase2_mode == MODE_STAGED_BLOCK) {
+                phase2_expand_staged(score_buf, hidden_buf, residual_buf,
+                                     cfg.seq_len, cfg.hidden_dim, score_row,
+                                     hidden_row, &score_stats, &hidden_stats,
+                                     &residual_stats);
+            } else {
+                phase2_expand_scalar(score_buf, hidden_buf, residual_buf,
+                                     cfg.seq_len, cfg.hidden_dim, &score_stats,
+                                     &hidden_stats, &residual_stats);
+            }
+            expand_end = now_sim_ns();
+
+            layernorm_begin = now_sim_ns();
+            if (phase2_mode == MODE_STAGED_BLOCK) {
+                phase2_layernorm_staged(hidden_buf, cfg.seq_len,
+                                        cfg.hidden_dim, hidden_row,
+                                        &hidden_stats);
+            } else {
+                phase2_layernorm_scalar(hidden_buf, cfg.seq_len,
+                                        cfg.hidden_dim, hidden_row,
+                                        &hidden_stats);
+            }
+            layernorm_end = now_sim_ns();
+
+            project_begin = now_sim_ns();
+            if (phase2_mode == MODE_STAGED_BLOCK) {
+                phase2_project_staged(hidden_buf, mlp_buf, cfg.seq_len,
+                                      cfg.hidden_dim, cfg.mlp_dim, block_elems,
+                                      hidden_row, mlp_block, &hidden_stats,
+                                      &mlp_stats);
+            } else {
+                phase2_project_scalar(hidden_buf, mlp_buf, cfg.seq_len,
+                                      cfg.hidden_dim, cfg.mlp_dim,
+                                      &hidden_stats, &mlp_stats);
+            }
+            project_end = now_sim_ns();
+
+            gelu_begin = now_sim_ns();
+            if (phase2_mode == MODE_STAGED_BLOCK) {
+                phase2_gelu_staged(mlp_buf, cfg.seq_len, cfg.mlp_dim,
+                                   block_elems, mlp_block, &mlp_stats);
+            } else {
+                phase2_gelu_scalar(mlp_buf, cfg.seq_len, cfg.mlp_dim,
+                                   &mlp_stats);
+            }
+            gelu_end = now_sim_ns();
+
+            residual_begin = now_sim_ns();
+            if (phase2_mode == MODE_STAGED_BLOCK) {
+                phase2_residual_staged(hidden_buf, residual_buf, cfg.seq_len,
+                                       cfg.hidden_dim, block_elems,
+                                       hidden_block, residual_block,
+                                       &hidden_stats, &residual_stats);
+            } else {
+                phase2_residual_scalar(hidden_buf, residual_buf, cfg.seq_len,
+                                       cfg.hidden_dim, &hidden_stats,
+                                       &residual_stats);
+            }
+            residual_end = now_sim_ns();
+
+            compact_begin = now_sim_ns();
+            if (phase2_mode == MODE_STAGED_BLOCK) {
+                phase2_compact_staged(hidden_buf, score_buf, cfg.seq_len,
+                                      cfg.hidden_dim, hidden_row, score_row,
+                                      &hidden_stats, &score_stats);
+            } else {
+                phase2_compact_scalar(hidden_buf, score_buf, cfg.seq_len,
+                                      cfg.hidden_dim, &hidden_stats,
+                                      &score_stats);
+            }
+            compact_end = now_sim_ns();
+
+            flush_remote_range(score_buf, score_bytes);
+            phase2_end = now_sim_ns();
+            printf("[Phase 2] done\n");
         } else {
-            phase2_softmax_scalar(score_buf, cfg.seq_len, score_row, &score_stats);
+            printf("[Phase 2] skipped for pure_gemm\n");
         }
-        softmax_end = now_sim_ns();
 
-        expand_begin = now_sim_ns();
-        if (phase2_mode == MODE_STAGED_BLOCK) {
-            phase2_expand_staged(score_buf, hidden_buf, residual_buf, cfg.seq_len,
-                                 cfg.hidden_dim, score_row, hidden_row,
-                                 &score_stats, &hidden_stats, &residual_stats);
+        phase3_begin = phase2_end;
+        phase3_end = phase2_end;
+
+        if (run_phase3) {
+            phase3_begin = now_sim_ns();
+            printf("[Phase 3] GEMM2 on device HDM...\n");
+            desc.addrA = matrix_base + matrix_span * 2ULL;
+            desc.addrC = matrix_base;
+            *flag_ptr = 0;
+            __builtin_memcpy((void *)desc_ptr, &desc, sizeof(desc));
+            _mm_clflush((const void *)desc_ptr);
+            _mm_clflush((const void *)flag_ptr);
+            asm volatile("mfence" ::: "memory");
+            *doorbell_ptr = desc_pa;
+            asm volatile("mfence" ::: "memory");
+            while (*flag_ptr == 0) {
+                poll_count_phase3 += 1;
+                asm volatile("pause");
+            }
+            phase3_end = now_sim_ns();
+            printf("[Phase 3] done\n");
         } else {
-            phase2_expand_scalar(score_buf, hidden_buf, residual_buf, cfg.seq_len,
-                                 cfg.hidden_dim, &score_stats, &hidden_stats,
-                                 &residual_stats);
+            printf("[Phase 3] skipped for pure_gemm\n");
         }
-        expand_end = now_sim_ns();
-
-        layernorm_begin = now_sim_ns();
-        if (phase2_mode == MODE_STAGED_BLOCK) {
-            phase2_layernorm_staged(hidden_buf, cfg.seq_len, cfg.hidden_dim,
-                                    hidden_row, &hidden_stats);
-        } else {
-            phase2_layernorm_scalar(hidden_buf, cfg.seq_len, cfg.hidden_dim,
-                                    hidden_row, &hidden_stats);
-        }
-        layernorm_end = now_sim_ns();
-
-        project_begin = now_sim_ns();
-        if (phase2_mode == MODE_STAGED_BLOCK) {
-            phase2_project_staged(hidden_buf, mlp_buf, cfg.seq_len,
-                                  cfg.hidden_dim, cfg.mlp_dim, block_elems,
-                                  hidden_row, mlp_block, &hidden_stats, &mlp_stats);
-        } else {
-            phase2_project_scalar(hidden_buf, mlp_buf, cfg.seq_len,
-                                  cfg.hidden_dim, cfg.mlp_dim, &hidden_stats,
-                                  &mlp_stats);
-        }
-        project_end = now_sim_ns();
-
-        gelu_begin = now_sim_ns();
-        if (phase2_mode == MODE_STAGED_BLOCK) {
-            phase2_gelu_staged(mlp_buf, cfg.seq_len, cfg.mlp_dim, block_elems,
-                               mlp_block, &mlp_stats);
-        } else {
-            phase2_gelu_scalar(mlp_buf, cfg.seq_len, cfg.mlp_dim, &mlp_stats);
-        }
-        gelu_end = now_sim_ns();
-
-        residual_begin = now_sim_ns();
-        if (phase2_mode == MODE_STAGED_BLOCK) {
-            phase2_residual_staged(hidden_buf, residual_buf, cfg.seq_len,
-                                   cfg.hidden_dim, block_elems, hidden_block,
-                                   residual_block, &hidden_stats, &residual_stats);
-        } else {
-            phase2_residual_scalar(hidden_buf, residual_buf, cfg.seq_len,
-                                   cfg.hidden_dim, &hidden_stats, &residual_stats);
-        }
-        residual_end = now_sim_ns();
-
-        compact_begin = now_sim_ns();
-        if (phase2_mode == MODE_STAGED_BLOCK) {
-            phase2_compact_staged(hidden_buf, score_buf, cfg.seq_len,
-                                  cfg.hidden_dim, hidden_row, score_row,
-                                  &hidden_stats, &score_stats);
-        } else {
-            phase2_compact_scalar(hidden_buf, score_buf, cfg.seq_len,
-                                  cfg.hidden_dim, &hidden_stats, &score_stats);
-        }
-        compact_end = now_sim_ns();
-
-        flush_remote_range(score_buf, score_bytes);
-        phase2_end = now_sim_ns();
-        printf("[Phase 2] done\n");
-
-        phase3_begin = now_sim_ns();
-        printf("[Phase 3] GEMM2 on device HDM...\n");
-        desc.addrA = matrix_base + matrix_span * 2ULL;
-        desc.addrC = matrix_base;
-        *flag_ptr = 0;
-        __builtin_memcpy((void *)desc_ptr, &desc, sizeof(desc));
-        _mm_clflush((const void *)desc_ptr);
-        _mm_clflush((const void *)flag_ptr);
-        asm volatile("mfence" ::: "memory");
-        *doorbell_ptr = desc_pa;
-        asm volatile("mfence" ::: "memory");
-        while (*flag_ptr == 0) {
-            poll_count_phase3 += 1;
-            asm volatile("pause");
-        }
-        phase3_end = now_sim_ns();
-        printf("[Phase 3] done\n");
 
         total_end = now_sim_ns();
         m5_dump_stats(0, 0);
@@ -861,14 +932,15 @@ main(int argc, char *argv[])
         phase3_ms = (phase3_end - phase3_begin) / 1.0e6;
 
         printf("[Timing] preset=%s\n", cfg.preset_name);
+        printf("[Timing] workload=%s\n", workload_name);
         printf("[Timing] phase2_mode=%s\n", cfg.phase2_mode_name);
         printf("[Timing] staged_block_bytes=%u\n", cfg.staged_block_bytes);
         printf("[Timing] gemm_tile_count_per_gemm=%llu\n",
                (unsigned long long)tile_count_per_gemm);
         printf("[Timing] gemm_tile_count_total=%llu\n",
-               (unsigned long long)(tile_count_per_gemm * 2ULL));
-        printf("[Timing] descriptor_launch_count=2\n");
-        printf("[Timing] doorbell_launch_count=2\n");
+               (unsigned long long)total_tile_count);
+        printf("[Timing] descriptor_launch_count=%u\n", descriptor_launch_count);
+        printf("[Timing] doorbell_launch_count=%u\n", descriptor_launch_count);
         printf("[Timing] phase1_poll_count=%llu\n", poll_count_phase1);
         printf("[Timing] phase3_poll_count=%llu\n", poll_count_phase3);
         printf("[Timing] phase1_ms=%.6f\n", phase1_ms);
@@ -948,7 +1020,7 @@ main(int argc, char *argv[])
                                     residual_stats.write_bytes +
                                     mlp_stats.read_bytes +
                                     mlp_stats.write_bytes));
-        printf("========== ViT-inspired proxy benchmark finished ==========\n");
+        printf("========== MatrixFlow benchmark finished ==========\n");
 
         free(mlp_block);
         free(residual_block);
