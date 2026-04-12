@@ -179,6 +179,8 @@ MatrixFlowEngine::onFetchDescComplete()
     ctx.baseC = pendingDesc.addrC;
     ctx.flagAddr = pendingDesc.flagAddr;
     ctx.size = pendingDesc.size;
+    ctx.completionValue =
+        pendingDesc.completionValue != 0 ? pendingDesc.completionValue : 1;
     ctx.elemBytes = sizeof(uint32_t);
     const uint32_t cap = static_cast<uint32_t>(kMaxTileDim);
     ctx.tileM = std::min(cap, ctx.size);
@@ -193,15 +195,18 @@ MatrixFlowEngine::onFetchDescComplete()
     pendingResult = ctx.baseC;
     pendingFlagAddr = ctx.flagAddr;
     pendingSize = static_cast<int>(ctx.size);
+    completionFlagValue = ctx.completionValue;
 
     DPRINTF(MatrixFlow,
             "Descriptor loaded: A=%#llx B=%#llx C=%#llx flag=%#llx size=%u "
-            "tile=(%u,%u,%u)\n",
+            "completion=%#llx tile=(%u,%u,%u)\n",
             static_cast<unsigned long long>(ctx.baseA),
             static_cast<unsigned long long>(ctx.baseB),
             static_cast<unsigned long long>(ctx.baseC),
             static_cast<unsigned long long>(ctx.flagAddr),
-            ctx.size, ctx.tileM, ctx.tileN, ctx.tileK);
+            ctx.size,
+            static_cast<unsigned long long>(ctx.completionValue),
+            ctx.tileM, ctx.tileN, ctx.tileK);
 
     prepareOutputTile();
     issueFetchATile();

@@ -56,9 +56,10 @@ class MatrixFlowEngine : public ClockedObject
         uint64_t addrC = 0;
         uint64_t flagAddr = 0;
         uint32_t size = 0;
+        uint64_t completionValue = 0;
     };
 
-    static_assert(sizeof(Descriptor) == 40,
+    static_assert(sizeof(Descriptor) == 48,
                   "MatrixFlow descriptor layout must stay stable");
 
     struct GemmContext
@@ -68,6 +69,7 @@ class MatrixFlowEngine : public ClockedObject
         Addr baseC = 0;
         Addr flagAddr = 0;
         uint32_t size = 0;
+        uint64_t completionValue = 0;
         uint32_t elemBytes = sizeof(uint32_t);
         uint32_t tileM = kMaxTileDim;
         uint32_t tileN = kMaxTileDim;

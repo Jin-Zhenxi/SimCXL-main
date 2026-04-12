@@ -23,8 +23,7 @@
 # THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-
+import os
 from typing import (
     List,
     Sequence,
@@ -35,9 +34,9 @@ from m5.objects import (
     AddrRange,
     BaseXBar,
     Bridge,
+    CowDiskImage,
     CXLBridge,
     CXLMemCtrl,
-    CowDiskImage,
     IdeDisk,
     IOXBar,
     NoncoherentXBar,
@@ -85,9 +84,19 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         cache_hierarchy: AbstractCacheHierarchy,
         cxl_memory: AbstractMemorySystem,
         is_asic: bool = True,
+        cxl_host_link_width_bytes: int = 32,
+        host_link_window_bytes: int = 0,
     ) -> None:
         self._cxl_memory_ptr = cxl_memory
         self._is_asic = is_asic
+        self._cxl_host_link_width_bytes = cxl_host_link_width_bytes
+        self._host_link_window_bytes = host_link_window_bytes
+        self._host_link_window_range = None
+        self._advertise_cxl_mem_to_guest = False
+        self._cxl_mem_range = None
+        self._enable_cxl_host_dma_bridge = (
+            os.environ.get("MATRIXFLOW_HOST_DMA_BRIDGE", "0") == "1"
+        )
 
         super().__init__(
             clk_freq=clk_freq,
@@ -107,7 +116,9 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
     def _setup_board(self) -> None:
         self.pc = Pc()
         # cxl_device is dynamically initialized and attached
-        self.pc.south_bridge.cxl_device = CXLMemCtrl(pci_func=0, pci_dev=6, pci_bus=0)
+        self.pc.south_bridge.cxl_device = CXLMemCtrl(
+            pci_func=0, pci_dev=6, pci_bus=0
+        )
 
         self.workload = X86FsLinux()
 
@@ -137,6 +148,7 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         # Configure CXL Device
         cxl_dram = self._cxl_memory_ptr
         cxl_mem_range = AddrRange(Addr(0x400000000), size=cxl_dram.get_size())
+        self._cxl_mem_range = cxl_mem_range
         cxl_dram.set_memory_range([cxl_mem_range])
         cxl_mem_ctrl = self.pc.south_bridge.cxl_device
         cxl_mem_ctrl.connectMemory(cxl_mem_range, cxl_dram)
@@ -182,8 +194,8 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
                 AddrRange(pci_config_address_space_base, Addr.max),
             ]
 
-            # Model a 64 GB/s host-device link with a dedicated 2 GHz fabric
-            # clock and a 32 B datapath (32 B * 2 GHz = 64 GB/s).
+            # Model the host-device link with a dedicated 2 GHz fabric clock.
+            # Effective bandwidth is width(B) * 2 GHz.
             self.pcie_fabric_clk_domain = SrcClockDomain()
             self.pcie_fabric_clk_domain.clock = "2GHz"
             self.pcie_fabric_clk_domain.voltage_domain = (
@@ -192,7 +204,7 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
 
             # XBar：保持 1 cycle（本地 fabric 极薄）；CXLBridge：恢复长链路延迟供 CPU 访存吃满惩罚
             self.cxl_xbar = NoncoherentXBar(
-                width=32,
+                width=self._cxl_host_link_width_bytes,
                 frontend_latency=1,
                 forward_latency=1,
                 response_latency=1,
@@ -220,6 +232,28 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
                 cxl_bar0_range,
                 cxl_mem_range,
             ]
+
+            if self._enable_cxl_host_dma_bridge:
+                self.host_dma_bridge = CXLBridge(
+                    bridge_lat="50ns",
+                    proto_proc_lat="12ns",
+                    req_fifo_depth=128,
+                    resp_fifo_depth=128,
+                    optimal_pkt_size=256,
+                    small_pkt_size=64,
+                    small_pkt_overhead_pct=0,
+                    large_pkt_size=4096,
+                    large_pkt_overhead_pct=36,
+                )
+                self.host_dma_bridge.clk_domain = self.pcie_fabric_clk_domain
+                self.host_dma_bridge.cpu_side_port = (
+                    self.cxl_xbar.mem_side_ports
+                )
+                self.host_dma_bridge.mem_side_port = (
+                    self.get_cache_hierarchy().get_cpu_side_port()
+                )
+                self.host_dma_bridge.ranges = [self.mem_ranges[0]]
+                cxl_mem_ctrl.dma = self.cxl_xbar.cpu_side_ports
 
             self.apicbridge = Bridge(delay="50ns")
             self.apicbridge.cpu_side_port = self.get_io_bus().mem_side_ports
@@ -320,6 +354,29 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         self.workload.intel_mp_table.base_entries = base_entries
         self.workload.intel_mp_table.ext_entries = ext_entries
 
+        host_link_window_start = None
+        if self._host_link_window_bytes:
+            total_mem_size = int(self.mem_ranges[0].size())
+            if self._host_link_window_bytes >= total_mem_size:
+                raise Exception(
+                    "host_link_window_bytes must be smaller than system memory"
+                )
+            host_link_window_start = (
+                int(self.mem_ranges[0].end())
+                + 1
+                - self._host_link_window_bytes
+            )
+            self._host_link_window_range = AddrRange(
+                Addr(host_link_window_start),
+                size=self._host_link_window_bytes,
+            )
+
+        usable_mem_size = (
+            host_link_window_start - 0x100000
+            if host_link_window_start is not None
+            else int(self.mem_ranges[0].size()) - 0x100000
+        )
+
         entries = [
             # Mark the first megabyte of memory as reserved
             X86E820Entry(addr=0, size="639kB", range_type=1),
@@ -327,7 +384,7 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             # Mark the rest of physical memory as available
             X86E820Entry(
                 addr=0x100000,
-                size=f"{self.mem_ranges[0].size() - 0x100000:d}B",
+                size=f"{usable_mem_size:d}B",
                 range_type=1,
             ),
         ]
@@ -341,6 +398,26 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         # bridge, but do not advertise it to the guest OS as system memory.
         # This isolates background Linux traffic from the hidden HDM region so
         # the MatrixEngine doorbell path can be validated in a clean setup.
+        if (
+            getattr(self, "_advertise_cxl_mem_to_guest", False)
+            and self._cxl_mem_range is not None
+        ):
+            entries.append(
+                X86E820Entry(
+                    addr=self._cxl_mem_range.start(),
+                    size=f"{self._cxl_mem_range.size()}B",
+                    range_type=20,
+                )
+            )
+
+        if self._host_link_window_range is not None:
+            entries.append(
+                X86E820Entry(
+                    addr=self._host_link_window_range.start(),
+                    size=f"{self._host_link_window_range.size()}B",
+                    range_type=2,
+                )
+            )
 
         self.workload.e820_table.entries = entries
 
