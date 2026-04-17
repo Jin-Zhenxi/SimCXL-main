@@ -147,6 +147,7 @@ CompoundFlag('XBar', ['BaseXBar', 'CoherentXBar', 'NoncoherentXBar',
 
 DebugFlag('Bridge')
 DebugFlag('MatrixFlow')
+DebugFlag('MatrixFlowTiming')
 DebugFlag('CommMonitor')
 DebugFlag('DRAM')
 DebugFlag('DRAMPower')

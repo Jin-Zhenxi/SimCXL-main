@@ -9,6 +9,7 @@
 #include "base/logging.hh"
 #include "base/trace.hh"
 #include "debug/MatrixFlow.hh"
+#include "debug/MatrixFlowTiming.hh"
 
 namespace gem5
 {
@@ -58,6 +59,12 @@ MatrixFlowEngine::MatrixFlowEngine(const Params &p)
       carryOverInheritInflight(p.carry_over_inherit_inflight),
       holeFillLeadRowsConfig(p.hole_fill_lead_rows),
       writeCOverlapBIssueBudgetRowsConfig(p.writec_overlap_b_issue_budget_rows),
+      bodyInteriorWritebackStripeRowsConfig(
+          p.body_interior_writeback_stripe_rows),
+      bodyInteriorWritebackMaxOutstandingStripesConfig(
+          p.body_interior_writeback_max_outstanding_stripes),
+      boundaryRightWritebackBytesConfig(
+          std::max<uint32_t>(1, p.boundary_right_writeback_bytes)),
       vipBRowsCapacityConfig(p.vip_b_rows_capacity),
       mhotBRowsCapacityConfig(p.mhot_b_rows_capacity),
       coverageShadowRowsCapacityConfig(p.coverage_shadow_rows_capacity),
@@ -187,6 +194,8 @@ MatrixFlowEngine::MatrixFlowEngine(const Params &p)
       nextFetchBBounceBuffer(kMaxTileDim * readBouncePitch, 0),
       nextOutputFetchBBounceBuffer(kMaxTileDim * readBouncePitch, 0),
       coverageGatherBBounceBuffer(kMaxTileDim * readBouncePitch, 0),
+      tailScratchpadBounceBuffer(readBouncePitch, 0),
+      aTailScratchpadBounceBuffer(readBouncePitch, 0),
       fetchABounceReqAddr(kMaxTileDim, 0),
       fetchABounceReqBytes(kMaxTileDim, 0),
       fetchABounceRowBytes(kMaxTileDim, 0),
@@ -217,6 +226,9 @@ MatrixFlowEngine::MatrixFlowEngine(const Params &p)
       coverageGatherBBounceRowBytes(kMaxTileDim, 0),
       coverageGatherBBounceOffset(kMaxTileDim, 0),
       coverageGatherBBounceActive(kMaxTileDim, false),
+      tailScratchpadBuffer(),
+      aTailScratchpadBuffer(),
+      outputHoldBuffer(),
       nextFetchARowGeneration(kMaxTileDim, 0),
       nextFetchBRowGeneration(kMaxTileDim, 0),
       nextOutputFetchBRowGeneration(kMaxTileDim, 0),
@@ -270,7 +282,9 @@ MatrixFlowEngine::MatrixFlowEngine(const Params &p)
       pendingMatrixB(0),
       pendingResult(0),
       pendingFlagAddr(0),
-      pendingSize(0),
+      pendingM(0),
+      pendingN(0),
+      pendingK(0),
       pendingDesc(),
       completionFlagValue(1),
       fetchDescCompleteEvent(
@@ -278,11 +292,22 @@ MatrixFlowEngine::MatrixFlowEngine(const Params &p)
       computeDoneEvent([this] { processComputeDone(); }, name() + ".compute"),
       writeFlagCompleteEvent(
           [this] { onWriteFlagComplete(); }, name() + ".write_flag"),
+      tailScratchpadLoadCompleteEvent(
+          [this] { onTailScratchpadLoadComplete(); },
+          name() + ".tail_scratchpad_load"),
+      aTailScratchpadLoadCompleteEvent(
+          [this] { onATailScratchpadLoadComplete(); },
+          name() + ".a_tail_scratchpad_load"),
+      heldOutputWriteCompleteEvent(
+          [this] { onHeldOutputWriteComplete(); },
+          name() + ".held_output_write"),
       stats(this)
 {
     fetchARowEvents.reserve(kMaxTileDim);
     fetchBRowEvents.reserve(kMaxTileDim);
     writeCRowEvents.reserve(kMaxTileDim);
+    earlyBodyWritebackRowEvents.reserve(kMaxTileDim);
+    boundaryOutputWriteEvents.reserve(kMaxBoundaryWriteEvents);
     nextFetchARowEvents.reserve(kMaxTileDim);
     nextFetchBRowEvents.reserve(kMaxTileDim);
     nextOutputFetchBRowEvents.reserve(kMaxTileDim);
@@ -297,6 +322,9 @@ MatrixFlowEngine::MatrixFlowEngine(const Params &p)
         writeCRowEvents.emplace_back(
             [this, i] { onWriteCRowComplete(i); },
             name() + ".writeC_row" + std::to_string(i));
+        earlyBodyWritebackRowEvents.emplace_back(
+            [this, i] { onEarlyBodyInteriorWritebackRowComplete(i); },
+            name() + ".early_body_write_row" + std::to_string(i));
         nextFetchARowEvents.emplace_back(
             [this, i] { onNextFetchARowComplete(i); },
             name() + ".next_fetchA_row" + std::to_string(i));
@@ -309,6 +337,11 @@ MatrixFlowEngine::MatrixFlowEngine(const Params &p)
         coverageGatherBRowEvents.emplace_back(
             [this, i] { onCoverageGatherBRowComplete(i); },
             name() + ".coverage_gatherB_row" + std::to_string(i));
+    }
+    for (int i = 0; i < kMaxBoundaryWriteEvents; ++i) {
+        boundaryOutputWriteEvents.emplace_back(
+            [this, i] { onBoundaryOutputWriteComplete(i); },
+            name() + ".boundary_output_write" + std::to_string(i));
     }
 
     DPRINTF(MatrixFlow,
@@ -533,6 +566,263 @@ MatrixFlowEngine::EngineStats::EngineStats(statistics::Group *parent)
                "Total bytes written to HDM by MatrixFlow DMA"),
       ADD_STAT(totalComputeCycles, statistics::units::Cycle::get(),
                "Total modeled MatrixFlow compute cycles"),
+      ADD_STAT(peeledBatchLaunchCount, statistics::units::Count::get(),
+               "How many peeled batch launches were accepted by the engine"),
+      ADD_STAT(peeledBatchSubproblemCount, statistics::units::Count::get(),
+               "How many peeled batch subproblems were executed in total"),
+      ADD_STAT(peeledBatchSingleDoorbellCount, statistics::units::Count::get(),
+               "How many peeled batch launches used a single doorbell"),
+      ADD_STAT(peeledBatchCompletionCount, statistics::units::Count::get(),
+               "How many peeled batches completed with a final guest-visible completion"),
+      ADD_STAT(peeledBatchGuestWaitCount, statistics::units::Count::get(),
+               "How many guest waits were expected for peeled batch launches"),
+      ADD_STAT(peeledBatchInternalStepCount, statistics::units::Count::get(),
+               "How many internal descriptor-to-descriptor steps were taken inside a peeled batch"),
+      ADD_STAT(adaptivePollBackoffCount, statistics::units::Count::get(),
+               "Guest-side adaptive poll backoff count reported by irregular GEMM path"),
+      ADD_STAT(completionVisibleWriteCount, statistics::units::Count::get(),
+               "How many guest-visible completion writes were issued"),
+      ADD_STAT(completionFinalVisibleLatency, statistics::units::Cycle::get(),
+               "Cycles between final visible completion write issue and completion"),
+      ADD_STAT(batchInternalCompletionCount, statistics::units::Count::get(),
+               "How many internal batch subproblem completions were recorded"),
+      ADD_STAT(batchGuestVisibleCompletionCount, statistics::units::Count::get(),
+               "How many batch completions were visible to the guest"),
+      ADD_STAT(residualDeviceOverheadCycles, statistics::units::Cycle::get(),
+               "Residual clean device-window cycles not explained by subproblem active windows"),
+      ADD_STAT(descriptorDecodeOverheadCycles, statistics::units::Cycle::get(),
+               "Cycles spent between descriptor fetch completion and descriptor decode/runnable setup"),
+      ADD_STAT(batchTransitionGapCycles, statistics::units::Cycle::get(),
+               "Cycles spent transitioning from one batch step completion to the next step fetch/decode"),
+      ADD_STAT(tailDependencyWaitCycles, statistics::units::Cycle::get(),
+               "Cycles spent waiting for tail scratchpad dependencies before first work issue"),
+      ADD_STAT(dmaDrainWaitCycles, statistics::units::Cycle::get(),
+               "Cycles spent between last useful work completion and subproblem completion commit"),
+      ADD_STAT(deviceFinalCompletionOverheadCycles, statistics::units::Cycle::get(),
+               "Cycles between final useful work completion and device completion flag write"),
+      ADD_STAT(finalCompletionCycles, statistics::units::Cycle::get(),
+               "Cycles from final useful work completion to device completion fully visible"),
+      ADD_STAT(finalWritebackDrainCycles, statistics::units::Cycle::get(),
+               "Cycles from final useful work completion to final writeback issue"),
+      ADD_STAT(writebackResponseDrainCycles, statistics::units::Cycle::get(),
+               "Cycles from final writeback issue to all writeback responses drained"),
+      ADD_STAT(completionEligibilityCycles, statistics::units::Cycle::get(),
+               "Cycles from writeback drain completion to completion eligibility satisfied"),
+      ADD_STAT(completionTokenWriteCycles, statistics::units::Cycle::get(),
+               "Cycles spent issuing and completing the completion token write"),
+      ADD_STAT(completionVisibilityCycles, statistics::units::Cycle::get(),
+               "Cycles from completion token write completion to device-side fully-visible completion"),
+      ADD_STAT(bodyPostGapCycles, statistics::units::Cycle::get(),
+               "Cycles attributed to the post-body gap before the next batch step fetches"),
+      ADD_STAT(rightEdgeNoOpGapCycles, statistics::units::Cycle::get(),
+               "Cycles attributed to the right-edge no-op step transition gap"),
+      ADD_STAT(bottomEdgePreStartGapCycles, statistics::units::Cycle::get(),
+               "Cycles attributed to the pre-start gap of bottom-edge execution"),
+      ADD_STAT(cornerFinalGapCycles, statistics::units::Cycle::get(),
+               "Cycles attributed to the final corner/completion gap"),
+      ADD_STAT(batchStepCount, statistics::units::Count::get(),
+               "How many batch steps were observed by residual autopsy"),
+      ADD_STAT(batchNoOpStepCount, statistics::units::Count::get(),
+               "How many batch steps completed as no-op in residual autopsy"),
+      ADD_STAT(batchTransitionCount, statistics::units::Count::get(),
+               "How many batch transitions were observed by residual autopsy"),
+      ADD_STAT(peeledLegacyLaunchCount, statistics::units::Count::get(),
+               "How many non-batched peeled subproblems were launched"),
+      ADD_STAT(peeledLegacyDoorbellCount, statistics::units::Count::get(),
+               "How many legacy peeled doorbells were fired"),
+      ADD_STAT(peeledLegacyCompletionWaitCount, statistics::units::Count::get(),
+               "How many guest-visible completion waits legacy peeled mode required"),
+      ADD_STAT(tailScratchpadLoadCount, statistics::units::Count::get(),
+               "How many times irregular B-tail scratchpad was populated"),
+      ADD_STAT(tailScratchpadBytesLoaded, statistics::units::Byte::get(),
+               "How many bytes were loaded into irregular B-tail scratchpad"),
+      ADD_STAT(tailScratchpadOccupancyPeak, statistics::units::Byte::get(),
+               "Peak occupancy of irregular B-tail scratchpad"),
+      ADD_STAT(tailScratchpadHitCount, statistics::units::Count::get(),
+               "How many B rows were served from irregular tail scratchpad"),
+      ADD_STAT(tailScratchpadMissCount, statistics::units::Count::get(),
+               "How many irregular tail scratchpad requests required a remote load"),
+      ADD_STAT(tailScratchpadReuseCount, statistics::units::Count::get(),
+               "How many irregular B-tail rows were reused from scratchpad after first load"),
+      ADD_STAT(tailScratchpadCapacityBytes, statistics::units::Byte::get(),
+               "Configured/effective capacity of irregular B-tail scratchpad"),
+      ADD_STAT(outputHoldStoreCount, statistics::units::Count::get(),
+               "How many output tiles were stored into irregular output hold"),
+      ADD_STAT(outputHoldBytesStored, statistics::units::Byte::get(),
+               "How many bytes were stored into irregular output hold"),
+      ADD_STAT(outputHoldOccupancyPeak, statistics::units::Byte::get(),
+               "Peak occupancy of irregular output hold"),
+      ADD_STAT(outputHoldReadForEpilogueCount, statistics::units::Count::get(),
+               "How many times irregular output hold was consulted during epilogue flow"),
+      ADD_STAT(outputHoldFinalWritebackCount, statistics::units::Count::get(),
+               "How many final writeback passes irregular output hold issued"),
+      ADD_STAT(outputHoldBytesWrittenBack, statistics::units::Byte::get(),
+               "How many bytes were written back from irregular output hold"),
+      ADD_STAT(bodyInteriorWritebackBytes, statistics::units::Byte::get(),
+               "Bytes written by early body-interior writeback"),
+      ADD_STAT(boundaryWritebackBytes, statistics::units::Byte::get(),
+               "Bytes written by final boundary-only writeback"),
+      ADD_STAT(bodyInteriorWritebackDrainCycles, statistics::units::Cycle::get(),
+               "Cycles from early body-interior writeback issue to drain"),
+      ADD_STAT(boundaryWritebackDrainCycles, statistics::units::Cycle::get(),
+               "Cycles from boundary-only writeback issue to drain"),
+      ADD_STAT(earlyBodyWritebackCount, statistics::units::Count::get(),
+               "How many early body-interior writeback regions were issued"),
+      ADD_STAT(boundaryOnlyHoldCount, statistics::units::Count::get(),
+               "How many irregular GEMMs used boundary-only final hold"),
+      ADD_STAT(bodyInteriorResponsesDrainedBeforeFinalCompletionCount,
+               statistics::units::Count::get(),
+               "How many early body-interior writeback regions drained before final completion"),
+      ADD_STAT(boundaryOutstandingWriteRespAtCompletionGate,
+               statistics::units::Count::get(),
+               "Boundary write responses still outstanding when entering final completion gate"),
+      ADD_STAT(interiorTileCount, statistics::units::Count::get(),
+               "Static output classifier count of interior output tiles"),
+      ADD_STAT(rightBoundaryTileCount, statistics::units::Count::get(),
+               "Static output classifier count of right-boundary output tiles"),
+      ADD_STAT(bottomBoundaryTileCount, statistics::units::Count::get(),
+               "Static output classifier count of bottom-boundary output tiles"),
+      ADD_STAT(cornerBoundaryTileCount, statistics::units::Count::get(),
+               "Static output classifier count of corner-boundary output tiles"),
+      ADD_STAT(interiorTileDirectWritebackCount,
+               statistics::units::Count::get(),
+               "How many preclassified interior tiles used direct early writeback"),
+      ADD_STAT(boundaryTileHoldCount, statistics::units::Count::get(),
+               "How many preclassified boundary tiles were assigned to hold path"),
+      ADD_STAT(boundaryTileWritebackCount, statistics::units::Count::get(),
+               "How many preclassified boundary tiles were released by boundary writeback"),
+      ADD_STAT(tileClassifierSetupCycles, statistics::units::Cycle::get(),
+               "Cycles spent in descriptor-time static output tile classification"),
+      ADD_STAT(tileClassifierHotPathChecks, statistics::units::Count::get(),
+               "Fallback geometry checks performed in the hot path by output classifier"),
+      ADD_STAT(boundaryWritebackCoalescingCount,
+               statistics::units::Count::get(),
+               "How many irregular GEMMs enabled boundary writeback coalescing"),
+      ADD_STAT(boundaryRightColumnPiggybackCount,
+               statistics::units::Count::get(),
+               "How many right-boundary column cells were piggybacked onto early row writeback"),
+      ADD_STAT(boundaryRightColumnPiggybackBytes,
+               statistics::units::Byte::get(),
+               "Right-boundary bytes piggybacked onto early row writeback"),
+      ADD_STAT(boundaryBottomEarlyWritebackCount,
+               statistics::units::Count::get(),
+               "How many bottom-boundary row segments were written back early"),
+      ADD_STAT(boundaryBottomEarlyWritebackBytes,
+               statistics::units::Byte::get(),
+               "Bottom-boundary bytes written back early"),
+      ADD_STAT(finalBoundaryWritebackRequestCount,
+               statistics::units::Count::get(),
+               "Final boundary writeback requests remaining after coalescing"),
+      ADD_STAT(streamingBodyWritebackCount,
+               statistics::units::Count::get(),
+               "How many irregular GEMMs enabled streaming row-band body writeback"),
+      ADD_STAT(streamingBodyWritebackBulkRequestCount,
+               statistics::units::Count::get(),
+               "How many bulk contiguous body/boundary writeback requests were issued"),
+      ADD_STAT(streamingBodyWritebackBytes,
+               statistics::units::Byte::get(),
+               "Bytes written by streaming row-band body writeback"),
+      ADD_STAT(tailPackOnceCount, statistics::units::Count::get(),
+               "How many irregular B-tail pack-once operations were performed"),
+      ADD_STAT(tailPackBytes, statistics::units::Byte::get(),
+               "How many bytes were packed into irregular B-tail scratchpad"),
+      ADD_STAT(rightEdgeServedFromTailScratchpadCount,
+               statistics::units::Count::get(),
+               "How many right-edge subproblems used irregular B-tail scratchpad"),
+      ADD_STAT(rightEdgeDescriptorNoOpCount, statistics::units::Count::get(),
+               "How many right-edge descriptors were converted to no-op by fused execution"),
+      ADD_STAT(rightEdgeServedFromAReuseCount, statistics::units::Count::get(),
+               "How many fused right-edge updates reused body A panels"),
+      ADD_STAT(rightEdgeAReuseBytesSaved, statistics::units::Byte::get(),
+               "Estimated A bytes avoided by fused right-edge reuse"),
+      ADD_STAT(rightEdgeActiveTimeCycles, statistics::units::Cycle::get(),
+               "Estimated cycles spent in fused right-edge accumulation"),
+      ADD_STAT(rightEdgeDmaReadBytes, statistics::units::Byte::get(),
+               "DMA bytes attributed to right-edge path"),
+      ADD_STAT(rightEdgeComputeCycles, statistics::units::Cycle::get(),
+               "Compute cycles attributed to right-edge path"),
+      ADD_STAT(bodyWaitForBTailCycles, statistics::units::Cycle::get(),
+               "Cycles body start was blocked by B-tail readiness in no-wait fused-right mode"),
+      ADD_STAT(bodyStartBlockedByBTailCount, statistics::units::Count::get(),
+               "How many body starts were blocked by B-tail readiness"),
+      ADD_STAT(bodyStartedWithoutBTailCount, statistics::units::Count::get(),
+               "How many body starts proceeded without waiting for B-tail readiness"),
+      ADD_STAT(btailPreloadCount, statistics::units::Count::get(),
+               "How many no-wait B-tail preloads were issued"),
+      ADD_STAT(btailPreloadLatencyCycles, statistics::units::Cycle::get(),
+               "Cycles from no-wait B-tail preload issue to ready"),
+      ADD_STAT(btailPreloadLeadCycles, statistics::units::Cycle::get(),
+               "Cycles B-tail was ready before first body useful work"),
+      ADD_STAT(btailPreloadOverlapCycles, statistics::units::Cycle::get(),
+               "Cycles of B-tail preload overlapped with body progress"),
+      ADD_STAT(fusedRightPendingCount, statistics::units::Count::get(),
+               "How many fused-right updates were deferred waiting for B-tail readiness"),
+      ADD_STAT(fusedRightActivatedCount, statistics::units::Count::get(),
+               "How many deferred fused-right updates were activated after B-tail readiness"),
+      ADD_STAT(fusedRightActivationDelayCycles, statistics::units::Cycle::get(),
+               "Cycles between first body useful work and B-tail ready activation"),
+      ADD_STAT(bodyWaitForATailCycles, statistics::units::Cycle::get(),
+               "Cycles body start was blocked by A-tail readiness in no-wait fused-bottom mode"),
+      ADD_STAT(bodyStartBlockedByATailCount, statistics::units::Count::get(),
+               "How many body starts were blocked by A-tail readiness"),
+      ADD_STAT(bodyStartedWithoutATailCount, statistics::units::Count::get(),
+               "How many body starts proceeded without waiting for A-tail readiness"),
+      ADD_STAT(atailPreloadCount, statistics::units::Count::get(),
+               "How many no-wait A-tail preloads were issued"),
+      ADD_STAT(atailPreloadLatencyCycles, statistics::units::Cycle::get(),
+               "Cycles from no-wait A-tail preload issue to ready"),
+      ADD_STAT(atailPreloadLeadCycles, statistics::units::Cycle::get(),
+               "Cycles A-tail was ready before first body useful work"),
+      ADD_STAT(atailPreloadOverlapCycles, statistics::units::Cycle::get(),
+               "Cycles of A-tail preload overlapped with body progress"),
+      ADD_STAT(fusedBottomPendingCount, statistics::units::Count::get(),
+               "How many fused-bottom updates were deferred waiting for A-tail readiness"),
+      ADD_STAT(fusedBottomActivatedCount, statistics::units::Count::get(),
+               "How many deferred fused-bottom updates were activated after A-tail readiness"),
+      ADD_STAT(fusedBottomActivationDelayCycles, statistics::units::Cycle::get(),
+               "Cycles between first body useful work and A-tail ready activation"),
+      ADD_STAT(bottomEdgeDescriptorNoOpCount, statistics::units::Count::get(),
+               "How many bottom-edge descriptors were converted to no-op by fused-bottom"),
+      ADD_STAT(cornerServedFromTailScratchpadCount,
+               statistics::units::Count::get(),
+               "How many corner subproblems used irregular B-tail scratchpad"),
+      ADD_STAT(bottomEdgeServedFromBReuseCount, statistics::units::Count::get(),
+               "How many fused bottom-edge updates reused body B panels"),
+      ADD_STAT(bottomEdgeBReuseBytesSaved, statistics::units::Byte::get(),
+               "Estimated B bytes avoided by fused bottom-edge reuse"),
+      ADD_STAT(bottomEdgeActiveTimeCycles, statistics::units::Cycle::get(),
+               "Estimated cycles spent in fused bottom-edge accumulation"),
+      ADD_STAT(bottomEdgeDmaReadBytes, statistics::units::Byte::get(),
+               "DMA bytes attributed to bottom-edge path"),
+      ADD_STAT(bottomEdgeComputeCycles, statistics::units::Cycle::get(),
+               "Compute cycles attributed to bottom-edge path"),
+      ADD_STAT(singleFusedIrregularDescriptorCount,
+               statistics::units::Count::get(),
+               "How many irregular GEMMs executed as a single fused descriptor/state machine"),
+      ADD_STAT(legacyBatchSubproblemCount, statistics::units::Count::get(),
+               "How many legacy batch-style irregular subproblems were still executed"),
+      ADD_STAT(fusedIrregularStateStepCount, statistics::units::Count::get(),
+               "How many explicit unified fused-irregular state-machine steps were taken"),
+      ADD_STAT(fusedStateTransitionOverheadCycles,
+               statistics::units::Cycle::get(),
+               "Cycles spent in unified fused-irregular state transitions"),
+      ADD_STAT(cornerIndependentActiveCycles, statistics::units::Cycle::get(),
+               "Cycles spent in an independent corner path"),
+      ADD_STAT(cornerCollapsedActiveCycles, statistics::units::Cycle::get(),
+               "Cycles spent in collapsed on-chip corner accumulation"),
+      ADD_STAT(cornerIndependentExecutionCount, statistics::units::Count::get(),
+               "How many times corner executed as an independent path"),
+      ADD_STAT(cornerCollapseCount, statistics::units::Count::get(),
+               "How many irregular GEMMs activated corner collapse"),
+      ADD_STAT(cornerServedFromTailOperandsCount,
+               statistics::units::Count::get(),
+               "How many collapsed corner updates were served from A-tail/B-tail operands"),
+      ADD_STAT(epilogueMergeCount, statistics::units::Count::get(),
+               "How many irregular epilogue merge stages were executed"),
+      ADD_STAT(epilogueCycles, statistics::units::Cycle::get(),
+               "Estimated cycles spent in irregular epilogue merge bookkeeping"),
+      ADD_STAT(singleWritebackCount, statistics::units::Count::get(),
+               "How many irregular batches used a single final writeback"),
       ADD_STAT(nextPrefetchIssueCount, statistics::units::Count::get(),
                "Number of next-tile prefetch attempts issued"),
       ADD_STAT(nextKPrefetchIssueCount, statistics::units::Count::get(),
@@ -1305,6 +1595,30 @@ MatrixFlowEngine::planReadRequest(Addr rowAddr, Addr rowBytes) const
     return std::make_tuple(reqAddr, reqBytes, offset);
 }
 
+Addr
+MatrixFlowEngine::matrixAAddr(const GemmContext &gctx, uint32_t row,
+                              uint32_t col) const
+{
+    return gctx.baseA +
+        ((static_cast<Addr>(row) * gctx.lda + col) * gctx.elemBytes);
+}
+
+Addr
+MatrixFlowEngine::matrixBAddr(const GemmContext &gctx, uint32_t row,
+                              uint32_t col) const
+{
+    return gctx.baseB +
+        ((static_cast<Addr>(row) * gctx.ldb + col) * gctx.elemBytes);
+}
+
+Addr
+MatrixFlowEngine::matrixCAddr(const GemmContext &gctx, uint32_t row,
+                              uint32_t col) const
+{
+    return gctx.baseC +
+        ((static_cast<Addr>(row) * gctx.ldc + col) * gctx.elemBytes);
+}
+
 void
 MatrixFlowEngine::resetContext()
 {
@@ -1316,9 +1630,108 @@ MatrixFlowEngine::resetContext()
     pendingMatrixB = 0;
     pendingResult = 0;
     pendingFlagAddr = 0;
-    pendingSize = 0;
+    pendingM = 0;
+    pendingN = 0;
+    pendingK = 0;
     pendingDesc = Descriptor();
     completionFlagValue = 1;
+    irregularBTailScratchpadOutputHoldActive = false;
+    irregularBatchRootBaseB = 0;
+    irregularBatchRootBaseC = 0;
+    irregularBatchRootLdb = 0;
+    irregularBatchRootLdc = 0;
+    irregularBatchBodyRows = 0;
+    irregularBatchBodyCols = 0;
+    currentSubproblemRowBase = 0;
+    currentSubproblemColBase = 0;
+    tailScratchpadValid = false;
+    tailScratchpadLoading = false;
+    tailScratchpadBaseB = 0;
+    tailScratchpadRows = 0;
+    tailScratchpadCols = 0;
+    tailScratchpadLoadNextRow = 0;
+    tailScratchpadLoadCompletedRows = 0;
+    tailScratchpadReqAddr = 0;
+    tailScratchpadReqBytes = 0;
+    tailScratchpadRowBytes = 0;
+    tailScratchpadReqOffset = 0;
+    tailScratchpadBounceActive = false;
+    tailScratchpadSingleShotActive = false;
+    btailPreloadIssuedTick = 0;
+    btailPreloadDoneTick = 0;
+    atailPreloadIssuedTick = 0;
+    atailPreloadDoneTick = 0;
+    bodyFirstUsefulWorkIssuedTick = 0;
+    tailScratchpadBuffer.clear();
+    outputHoldActive = false;
+    outputHoldFinalWritebackInProgress = false;
+    outputHoldBaseC = 0;
+    outputHoldRows = 0;
+    outputHoldCols = 0;
+    outputHoldLdc = 0;
+    outputHoldWritebackNextRow = 0;
+    outputHoldWritebackCompletedRows = 0;
+    irregularFusedEdgesCompletionOptimizedActive = false;
+    aTailScratchpadValid = false;
+    aTailScratchpadLoading = false;
+    aTailScratchpadBaseA = 0;
+    aTailScratchpadRows = 0;
+    aTailScratchpadCols = 0;
+    aTailScratchpadReqAddr = 0;
+    aTailScratchpadReqBytes = 0;
+    aTailScratchpadRowBytes = 0;
+    aTailScratchpadReqOffset = 0;
+    aTailScratchpadBounceActive = false;
+    aTailScratchpadBuffer.clear();
+    pendingFusedRightTiles.clear();
+    pendingFusedBottomTiles.clear();
+    finalCompletionChainAutopsyActive = false;
+    cornerCollapseActivatedThisBatch = false;
+    earlyBodyWritebackQueue.clear();
+    earlyBodyWritebackActiveRegion = OutputWriteRegion();
+    earlyBodyWritebackActive = false;
+    boundaryOnlyFinalWritebackRequested = false;
+    boundaryOnlyFinalWritebackActive = false;
+    boundaryWritebackRequests.clear();
+    boundaryWritebackNextReq = 0;
+    boundaryWritebackCompletedReqs = 0;
+    staticOutputTileClassifierValid = false;
+    staticOutputTileBoundaryStatsCounted = false;
+    coalescedRightBoundaryCovered = false;
+    coalescedBottomBoundaryCovered = false;
+    staticOutputTileDim = 0;
+    staticOutputTileRows = 0;
+    staticOutputTileCols = 0;
+    staticOutputMainRows = 0;
+    staticOutputMainCols = 0;
+    staticInteriorTileCount = 0;
+    staticRightBoundaryTileCount = 0;
+    staticBottomBoundaryTileCount = 0;
+    staticCornerBoundaryTileCount = 0;
+    staticOutputTileClassifierBeginTick = 0;
+    staticOutputTileClassifierEndTick = 0;
+    staticOutputTileClasses.clear();
+    bodyInteriorWritebackBeginTick = 0;
+    bodyInteriorWritebackIssuedTick = 0;
+    bodyInteriorWritebackDrainedTick = 0;
+    boundaryOutputWritebackBeginTick = 0;
+    boundaryOutputWritebackIssuedTick = 0;
+    boundaryOutputWritebackDrainedTick = 0;
+    completionVisibleWriteStartTick = 0;
+    finalWritebackBeginTick = 0;
+    finalWritebackIssuedTick = 0;
+    finalWritebackAllResponsesDrainedTick = 0;
+    completionEligibilitySatisfiedTick = 0;
+    deviceCompletionFlagWriteBeginTick = 0;
+    deviceCompletionFlagWriteEndTick = 0;
+    deviceCompletionFullyVisibleTick = 0;
+    outputHoldBuffer.clear();
+    subproblemStartDmaRead = 0;
+    subproblemStartDmaWrite = 0;
+    subproblemStartComputeCycles = 0;
+    batchSequenceActive = false;
+    nextBatchDescAddr = 0;
+    batchSubproblemIndex = 0;
     hierarchicalDebugComputeDeferCount = 0;
     reqsIssuedA = reqsCompletedA = targetReqsA = 0;
     reqsIssuedB = reqsCompletedB = targetReqsB = 0;
@@ -1388,16 +1801,2074 @@ MatrixFlowEngine::resetContext()
     stats.coverageShadowPoolCapacity = coverageShadowRowsCapacityConfig;
 }
 
+void
+MatrixFlowEngine::startDescriptorInternal(Addr descriptorAddr, bool batchStep)
+{
+    if (!batchStep && !batchSequenceActive) {
+        resetResidualAutopsyState();
+        deviceWindowBeginTick = curTick();
+        DPRINTF(MatrixFlowTiming,
+                "deviceWindowBegin: tick=%llu\n",
+                static_cast<unsigned long long>(deviceWindowBeginTick));
+    }
+    computeBusy = true;
+    pendingDescAddr = descriptorAddr;
+    subproblemStartDmaRead =
+        static_cast<uint64_t>(stats.totalDmaBytesRead.value());
+    subproblemStartDmaWrite =
+        static_cast<uint64_t>(stats.totalDmaBytesWritten.value());
+    subproblemStartComputeCycles =
+        static_cast<uint64_t>(stats.totalComputeCycles.value());
+    hierarchicalDebugComputeDeferCount = 0;
+    clearFallbackAutopsyTracking();
+
+    if (batchStep) {
+        stats.peeledBatchInternalStepCount++;
+    }
+
+    if (hierarchicalProtectedBSchedulerMode()) {
+        warn("%s: hier-trace startMatrixCompute accepted desc=%#llx batchStep=%d\n",
+             name(), static_cast<unsigned long long>(descriptorAddr), batchStep);
+    }
+
+    DPRINTF(MatrixFlowTiming,
+            "startMatrixCompute: descriptor=%#llx batchStep=%d\n",
+            static_cast<unsigned long long>(descriptorAddr), batchStep);
+
+    issueFetchDescriptor();
+}
+
+void
+MatrixFlowEngine::resetResidualAutopsyState()
+{
+    deviceWindowBeginTick = 0;
+    deviceWindowEndTick = 0;
+    finalUsefulWorkDoneTick = 0;
+    batchStepDescFetchedTicks.fill(0);
+    batchStepDescDecodedTicks.fill(0);
+    batchStepRunnableTicks.fill(0);
+    batchStepFirstWorkIssuedTicks.fill(0);
+    batchStepLastWorkCompletedTicks.fill(0);
+    batchStepCompletionCommittedTicks.fill(0);
+    batchTransitionBeginTicks.fill(0);
+    batchTransitionEndTicks.fill(0);
+    tailDependencyWaitBeginTicks.fill(0);
+    tailDependencyWaitEndTicks.fill(0);
+}
+
+void
+MatrixFlowEngine::markBatchStepFirstWorkIssued()
+{
+    const uint32_t idx = std::min<uint32_t>(batchSubproblemIndex,
+        kResidualAutopsyMaxBatchSteps - 1);
+    if (batchStepFirstWorkIssuedTicks[idx] == 0) {
+        batchStepFirstWorkIssuedTicks[idx] = curTick();
+        DPRINTF(MatrixFlowTiming,
+                "batchStepFirstWorkIssued: index=%u tick=%llu\n",
+                idx, static_cast<unsigned long long>(curTick()));
+        markTailDependencyWaitEnd();
+    }
+}
+
+void
+MatrixFlowEngine::markTailDependencyWaitBegin()
+{
+    const uint32_t idx = std::min<uint32_t>(batchSubproblemIndex,
+        kResidualAutopsyMaxBatchSteps - 1);
+    if (tailDependencyWaitBeginTicks[idx] == 0) {
+        tailDependencyWaitBeginTicks[idx] = curTick();
+        DPRINTF(MatrixFlowTiming,
+                "tailScratchpadWaitBegin: index=%u tick=%llu\n",
+                idx, static_cast<unsigned long long>(curTick()));
+    }
+}
+
+void
+MatrixFlowEngine::markTailDependencyWaitEnd()
+{
+    const uint32_t idx = std::min<uint32_t>(batchSubproblemIndex,
+        kResidualAutopsyMaxBatchSteps - 1);
+    if (tailDependencyWaitBeginTicks[idx] != 0 &&
+        tailDependencyWaitEndTicks[idx] == 0 &&
+        curTick() >= tailDependencyWaitBeginTicks[idx]) {
+        tailDependencyWaitEndTicks[idx] = curTick();
+        const Tick delta = tailDependencyWaitEndTicks[idx] -
+                           tailDependencyWaitBeginTicks[idx];
+        stats.tailDependencyWaitCycles += delta / clockPeriod();
+        DPRINTF(MatrixFlowTiming,
+                "tailScratchpadWaitEnd: index=%u tick=%llu cycles=%llu\n",
+                idx, static_cast<unsigned long long>(curTick()),
+                static_cast<unsigned long long>(delta / clockPeriod()));
+    }
+}
+
+void
+MatrixFlowEngine::markBatchStepLastWorkCompleted(const char *reason)
+{
+    const uint32_t idx = std::min<uint32_t>(batchSubproblemIndex,
+        kResidualAutopsyMaxBatchSteps - 1);
+    if (batchStepLastWorkCompletedTicks[idx] == 0) {
+        batchStepLastWorkCompletedTicks[idx] = curTick();
+        DPRINTF(MatrixFlowTiming,
+                "batchStepLastWorkCompleted: index=%u tick=%llu reason=%s\n",
+                idx, static_cast<unsigned long long>(curTick()), reason);
+    }
+}
+
+void
+MatrixFlowEngine::accumulateResidualAutopsyAtFinish(bool writeCompletion)
+{
+    const uint32_t idx = std::min<uint32_t>(batchSubproblemIndex,
+        kResidualAutopsyMaxBatchSteps - 1);
+    batchStepCompletionCommittedTicks[idx] = curTick();
+    stats.batchStepCount++;
+    DPRINTF(MatrixFlowTiming,
+            "batchStepCompletionCommitted: index=%u tick=%llu writeCompletion=%d\n",
+            idx, static_cast<unsigned long long>(curTick()), writeCompletion);
+
+    if (!writeCompletion &&
+        batchStepLastWorkCompletedTicks[idx] != 0 &&
+        curTick() >= batchStepLastWorkCompletedTicks[idx]) {
+        const Tick drain = curTick() - batchStepLastWorkCompletedTicks[idx];
+        stats.dmaDrainWaitCycles += drain / clockPeriod();
+    }
+
+    if (writeCompletion && finalUsefulWorkDoneTick != 0 &&
+        curTick() >= finalUsefulWorkDoneTick) {
+        const Tick final_gap = curTick() - finalUsefulWorkDoneTick;
+        stats.deviceFinalCompletionOverheadCycles +=
+            final_gap / clockPeriod();
+        stats.cornerFinalGapCycles += final_gap / clockPeriod();
+        deviceWindowEndTick = curTick();
+        DPRINTF(MatrixFlowTiming,
+                "deviceWindowEnd: tick=%llu\n",
+                static_cast<unsigned long long>(deviceWindowEndTick));
+
+        Tick active_sum = 0;
+        std::array<Tick, kResidualAutopsyMaxBatchSteps> active_cycles{};
+        for (uint32_t step = 0; step < kResidualAutopsyMaxBatchSteps; ++step) {
+            if (batchStepFirstWorkIssuedTicks[step] != 0 &&
+                batchStepLastWorkCompletedTicks[step] >=
+                    batchStepFirstWorkIssuedTicks[step]) {
+                active_cycles[step] =
+                    batchStepLastWorkCompletedTicks[step] -
+                    batchStepFirstWorkIssuedTicks[step];
+                active_sum += active_cycles[step];
+            }
+            DPRINTF(MatrixFlowTiming,
+                    "batchStepActiveWindow: index=%u first=%llu last=%llu cycles=%llu\n",
+                    step,
+                    static_cast<unsigned long long>(
+                        batchStepFirstWorkIssuedTicks[step]),
+                    static_cast<unsigned long long>(
+                        batchStepLastWorkCompletedTicks[step]),
+                    static_cast<unsigned long long>(
+                        active_cycles[step] / clockPeriod()));
+        }
+
+        if (deviceWindowBeginTick != 0 &&
+            deviceWindowEndTick >= deviceWindowBeginTick) {
+            const Tick window = deviceWindowEndTick - deviceWindowBeginTick;
+            const Tick residual = window > active_sum ? (window - active_sum) : 0;
+            stats.residualDeviceOverheadCycles += residual / clockPeriod();
+            DPRINTF(MatrixFlowTiming,
+                    "residualDeviceOverheadSummary: windowCycles=%llu "
+                    "activeCycles=%llu residualCycles=%llu "
+                    "decodeCycles=%llu transitionCycles=%llu "
+                    "tailWaitCycles=%llu dmaDrainCycles=%llu "
+                    "finalCompletionCycles=%llu "
+                    "bodyActiveCycles=%llu rightActiveCycles=%llu "
+                    "bottomActiveCycles=%llu cornerActiveCycles=%llu "
+                    "batchSteps=%llu noOpSteps=%llu transitions=%llu\n",
+                    static_cast<unsigned long long>(window / clockPeriod()),
+                    static_cast<unsigned long long>(active_sum / clockPeriod()),
+                    static_cast<unsigned long long>(residual / clockPeriod()),
+                    static_cast<unsigned long long>(
+                        stats.descriptorDecodeOverheadCycles.value()),
+                    static_cast<unsigned long long>(
+                        stats.batchTransitionGapCycles.value()),
+                    static_cast<unsigned long long>(
+                        stats.tailDependencyWaitCycles.value()),
+                    static_cast<unsigned long long>(
+                        stats.dmaDrainWaitCycles.value()),
+                    static_cast<unsigned long long>(
+                        stats.deviceFinalCompletionOverheadCycles.value()),
+                    static_cast<unsigned long long>(
+                        active_cycles[0] / clockPeriod()),
+                    static_cast<unsigned long long>(
+                        active_cycles[1] / clockPeriod()),
+                    static_cast<unsigned long long>(
+                        active_cycles[2] / clockPeriod()),
+                    static_cast<unsigned long long>(
+                        active_cycles[3] / clockPeriod()),
+                    static_cast<unsigned long long>(stats.batchStepCount.value()),
+                    static_cast<unsigned long long>(stats.batchNoOpStepCount.value()),
+                    static_cast<unsigned long long>(
+                        stats.batchTransitionCount.value()));
+        }
+    }
+}
+
+bool
+MatrixFlowEngine::irregularBTailScratchpadOutputHoldMode() const
+{
+    return irregularBTailScratchpadOutputHoldActive &&
+           (ctx.flags & kDescFlagIrregularBTailScratchpadOutputHold);
+}
+
+bool
+MatrixFlowEngine::irregularFusedEdgesCompletionOptimizedMode() const
+{
+    return (ctx.flags & kDescFlagIrregularFusedEdgesCompletionOptimized);
+}
+
+bool
+MatrixFlowEngine::irregularFusedRightEdgeCleanTimingMode() const
+{
+    return (ctx.flags & kDescFlagIrregularFusedRightEdgeCleanTiming);
+}
+
+bool
+MatrixFlowEngine::irregularNoWaitFusedRightMode() const
+{
+    return (ctx.flags & kDescFlagIrregularNoWaitFusedRight);
+}
+
+bool
+MatrixFlowEngine::irregularNoWaitFusedBottomMode() const
+{
+    return (ctx.flags & kDescFlagIrregularNoWaitFusedBottom);
+}
+
+bool
+MatrixFlowEngine::irregularSingleFusedDescriptorCornerCollapseMode() const
+{
+    return (ctx.flags & kDescFlagIrregularSingleFusedDescriptorCornerCollapse);
+}
+
+bool
+MatrixFlowEngine::irregularFinalCompletionChainAutopsyMode() const
+{
+    return finalCompletionChainAutopsyActive;
+}
+
+bool
+MatrixFlowEngine::irregularBoundaryOnlyHoldEarlyBodyWritebackMode() const
+{
+    return (ctx.flags &
+            kDescFlagIrregularBoundaryOnlyHoldEarlyBodyWriteback);
+}
+
+bool
+MatrixFlowEngine::irregularStaticOutputTileClassifierBoundaryHoldMode() const
+{
+    return (ctx.flags &
+            kDescFlagIrregularStaticOutputTileClassifierBoundaryHold);
+}
+
+bool
+MatrixFlowEngine::irregularBoundaryWritebackCoalescingMode() const
+{
+    return (ctx.flags & kDescFlagIrregularBoundaryWritebackCoalescing);
+}
+
+bool
+MatrixFlowEngine::irregularStreamingBodyWritebackMode() const
+{
+    return (ctx.flags & kDescFlagIrregularStreamingBodyWriteback);
+}
+
+bool
+MatrixFlowEngine::currentSubproblemUsesTailScratchpad() const
+{
+    if (!((ctx.flags & kDescFlagIrregularBTailScratchpadOutputHold) ||
+          (ctx.flags & kDescFlagIrregularFusedEdgesCompletionOptimized) ||
+          (ctx.flags & kDescFlagIrregularFusedRightEdgeCleanTiming) ||
+          (ctx.flags & kDescFlagIrregularNoWaitFusedRight) ||
+          (ctx.flags & kDescFlagIrregularNoWaitFusedBottom) ||
+          (ctx.flags & kDescFlagIrregularSingleFusedDescriptorCornerCollapse) ||
+          (ctx.flags & kDescFlagIrregularBoundaryOnlyHoldEarlyBodyWriteback) ||
+          (ctx.flags & kDescFlagIrregularStaticOutputTileClassifierBoundaryHold) ||
+          (ctx.flags & kDescFlagIrregularBoundaryWritebackCoalescing) ||
+          (ctx.flags & kDescFlagIrregularStreamingBodyWriteback) ||
+          irregularBTailScratchpadOutputHoldActive)) {
+        return false;
+    }
+    if (irregularFusedRightEdgeCleanTimingMode()) {
+        return batchSequenceActive && batchSubproblemIndex == 3;
+    }
+    return batchSequenceActive &&
+           (batchSubproblemIndex == 1 || batchSubproblemIndex == 3);
+}
+
+bool
+MatrixFlowEngine::currentSubproblemUsesOutputHold() const
+{
+    return outputHoldActive &&
+           ((ctx.flags & kDescFlagIrregularBTailScratchpadOutputHold) ||
+            (ctx.flags & kDescFlagIrregularFusedEdgesCompletionOptimized) ||
+            (ctx.flags & kDescFlagIrregularFusedRightEdgeCleanTiming) ||
+            (ctx.flags & kDescFlagIrregularNoWaitFusedRight) ||
+            (ctx.flags & kDescFlagIrregularNoWaitFusedBottom) ||
+            (ctx.flags & kDescFlagIrregularSingleFusedDescriptorCornerCollapse) ||
+            (ctx.flags & kDescFlagIrregularBoundaryOnlyHoldEarlyBodyWriteback) ||
+            (ctx.flags & kDescFlagIrregularStaticOutputTileClassifierBoundaryHold) ||
+            (ctx.flags & kDescFlagIrregularBoundaryWritebackCoalescing) ||
+            (ctx.flags & kDescFlagIrregularStreamingBodyWriteback) ||
+            irregularBTailScratchpadOutputHoldActive);
+}
+
+bool
+MatrixFlowEngine::currentSubproblemUsesFusedEdges() const
+{
+    return batchSequenceActive && batchSubproblemIndex == 0 &&
+           ((ctx.flags & kDescFlagIrregularFusedEdgesCompletionOptimized) ||
+            (ctx.flags & kDescFlagIrregularFusedRightEdgeCleanTiming) ||
+            (ctx.flags & kDescFlagIrregularNoWaitFusedRight) ||
+            (ctx.flags & kDescFlagIrregularNoWaitFusedBottom) ||
+            (ctx.flags & kDescFlagIrregularSingleFusedDescriptorCornerCollapse) ||
+            (ctx.flags & kDescFlagIrregularBoundaryOnlyHoldEarlyBodyWriteback) ||
+            (ctx.flags & kDescFlagIrregularStaticOutputTileClassifierBoundaryHold) ||
+            (ctx.flags & kDescFlagIrregularBoundaryWritebackCoalescing) ||
+            (ctx.flags & kDescFlagIrregularStreamingBodyWriteback));
+}
+
+void
+MatrixFlowEngine::initIrregularBatchSharedState()
+{
+    if (!((ctx.flags & kDescFlagIrregularBTailScratchpadOutputHold) ||
+          (ctx.flags & kDescFlagIrregularFusedEdgesCompletionOptimized) ||
+          (ctx.flags & kDescFlagIrregularFusedRightEdgeCleanTiming) ||
+          (ctx.flags & kDescFlagIrregularNoWaitFusedRight) ||
+          (ctx.flags & kDescFlagIrregularNoWaitFusedBottom) ||
+          (ctx.flags & kDescFlagIrregularSingleFusedDescriptorCornerCollapse) ||
+          (ctx.flags & kDescFlagIrregularBoundaryOnlyHoldEarlyBodyWriteback) ||
+          (ctx.flags & kDescFlagIrregularStaticOutputTileClassifierBoundaryHold) ||
+          (ctx.flags & kDescFlagIrregularBoundaryWritebackCoalescing) ||
+          (ctx.flags & kDescFlagIrregularStreamingBodyWriteback)) ||
+        !(ctx.flags & kDescFlagPeeledSubproblem)) {
+        return;
+    }
+    if (batchSubproblemIndex == 0) {
+        irregularBTailScratchpadOutputHoldActive = true;
+        irregularFusedEdgesCompletionOptimizedActive =
+            ((ctx.flags & kDescFlagIrregularFusedEdgesCompletionOptimized) ||
+             (ctx.flags & kDescFlagIrregularFusedRightEdgeCleanTiming) ||
+             (ctx.flags & kDescFlagIrregularNoWaitFusedRight) ||
+             (ctx.flags & kDescFlagIrregularNoWaitFusedBottom) ||
+             (ctx.flags & kDescFlagIrregularSingleFusedDescriptorCornerCollapse) ||
+             (ctx.flags & kDescFlagIrregularStaticOutputTileClassifierBoundaryHold) ||
+             (ctx.flags & kDescFlagIrregularBoundaryWritebackCoalescing) ||
+             (ctx.flags & kDescFlagIrregularStreamingBodyWriteback));
+        irregularBatchRootBaseB = ctx.baseB;
+        irregularBatchRootBaseC = ctx.baseC;
+        irregularBatchRootLdb = ctx.ldb;
+        irregularBatchRootLdc = ctx.ldc;
+        irregularBatchBodyRows = ctx.mTotal;
+        irregularBatchBodyCols = ctx.nTotal;
+        outputHoldBaseC = ctx.baseC;
+        outputHoldRows = ctx.ldc;
+        outputHoldCols = ctx.ldc;
+        outputHoldLdc = ctx.ldc;
+        outputHoldBuffer.assign(
+            static_cast<size_t>(outputHoldRows) * outputHoldCols *
+                ctx.elemBytes,
+            0);
+        outputHoldActive = true;
+        outputHoldFinalWritebackInProgress = false;
+        stats.outputHoldOccupancyPeak =
+            std::max<uint64_t>(static_cast<uint64_t>(
+                                   static_cast<size_t>(outputHoldRows) *
+                                   outputHoldCols * ctx.elemBytes),
+                               static_cast<uint64_t>(
+                                   stats.outputHoldOccupancyPeak.value()));
+        completionVisibleWriteStartTick = 0;
+    }
+
+    if (ctx.baseC >= irregularBatchRootBaseC && ctx.ldc != 0) {
+        const Addr offsetElems =
+            (ctx.baseC - irregularBatchRootBaseC) / ctx.elemBytes;
+        currentSubproblemRowBase = offsetElems / ctx.ldc;
+        currentSubproblemColBase = offsetElems % ctx.ldc;
+    } else {
+        currentSubproblemRowBase = 0;
+        currentSubproblemColBase = 0;
+    }
+}
+
+bool
+MatrixFlowEngine::currentSubproblemIsFusedNoOp() const
+{
+    if (irregularFusedRightEdgeCleanTimingMode() ||
+        irregularNoWaitFusedRightMode()) {
+        if (batchSequenceActive && batchSubproblemIndex == 1) {
+            return true;
+        }
+        if (irregularNoWaitFusedBottomMode() && batchSubproblemIndex == 2) {
+            return true;
+        }
+        return false;
+    }
+    return batchSequenceActive && batchSubproblemIndex > 0 &&
+           (ctx.flags & kDescFlagIrregularFusedEdgesCompletionOptimized);
+}
+
+uint32_t
+MatrixFlowEngine::irregularTailStartRow() const
+{
+    return std::min(irregularBatchBodyRows, outputHoldRows);
+}
+
+uint32_t
+MatrixFlowEngine::irregularTailStartCol() const
+{
+    return std::min(irregularBatchBodyCols, outputHoldCols);
+}
+
+uint32_t
+MatrixFlowEngine::irregularTailRows() const
+{
+    const uint32_t start = irregularTailStartRow();
+    return outputHoldRows > start ? (outputHoldRows - start) : 0;
+}
+
+uint32_t
+MatrixFlowEngine::irregularTailCols() const
+{
+    const uint32_t start = irregularTailStartCol();
+    return outputHoldCols > start ? (outputHoldCols - start) : 0;
+}
+
+void
+MatrixFlowEngine::maybeStartIrregularPreludeLoads()
+{
+    if (!currentSubproblemUsesFusedEdges()) {
+        return;
+    }
+    if (!tailScratchpadValid && !tailScratchpadLoading) {
+        if (!irregularNoWaitFusedRightMode()) {
+            markTailDependencyWaitBegin();
+        }
+        issueTailScratchpadLoad();
+        if (!irregularFusedRightEdgeCleanTimingMode()) {
+            return;
+        }
+    }
+    if ((irregularNoWaitFusedBottomMode() ||
+         irregularSingleFusedDescriptorCornerCollapseMode()) &&
+        !aTailScratchpadValid && !aTailScratchpadLoading) {
+        issueATailScratchpadLoad();
+    }
+    if (irregularFusedRightEdgeCleanTimingMode()) {
+        return;
+    }
+    if (!aTailScratchpadValid) {
+        markTailDependencyWaitBegin();
+        issueATailScratchpadLoad();
+        return;
+    }
+}
+
+void
+MatrixFlowEngine::issueTailScratchpadLoad()
+{
+    markBatchStepFirstWorkIssued();
+    panic_if(!(currentSubproblemUsesTailScratchpad() ||
+               currentSubproblemUsesFusedEdges()),
+             "%s: tail scratchpad requested on non-tail subproblem\n", name());
+
+    Addr targetBaseB = ctx.baseB;
+    uint32_t targetRows = ctx.kTotal;
+    uint32_t targetCols = ctx.nTotal;
+    const uint32_t tailCols = irregularTailCols();
+    if (currentSubproblemUsesFusedEdges() &&
+        (irregularFusedRightEdgeCleanTimingMode() ||
+         irregularNoWaitFusedRightMode() ||
+         irregularNoWaitFusedBottomMode() ||
+         irregularSingleFusedDescriptorCornerCollapseMode())) {
+        targetBaseB = irregularBatchRootBaseB +
+            static_cast<Addr>(irregularTailStartCol()) * ctx.elemBytes;
+        targetCols = tailCols;
+    }
+    const bool noWaitPackedTail =
+        (irregularNoWaitFusedRightMode() ||
+         irregularNoWaitFusedBottomMode() ||
+         irregularSingleFusedDescriptorCornerCollapseMode()) &&
+        (currentSubproblemUsesFusedEdges() ||
+         (batchSequenceActive && batchSubproblemIndex == 3));
+    if (noWaitPackedTail) {
+        const Addr outputBytes = static_cast<Addr>(outputHoldRows) *
+            outputHoldCols * ctx.elemBytes;
+        targetBaseB = irregularBatchRootBaseC + roundUpAddr(outputBytes, 64);
+        targetCols = tailCols;
+    }
+
+    const size_t totalBytes =
+        static_cast<size_t>(targetRows) * targetCols * ctx.elemBytes;
+    if (!tailScratchpadValid || tailScratchpadBaseB != targetBaseB ||
+        tailScratchpadRows != targetRows || tailScratchpadCols != targetCols) {
+        tailScratchpadValid = false;
+        tailScratchpadLoading = true;
+        tailScratchpadBaseB = targetBaseB;
+        tailScratchpadRows = targetRows;
+        tailScratchpadCols = targetCols;
+        tailScratchpadBuffer.assign(totalBytes, 0);
+        tailScratchpadLoadNextRow = 0;
+        tailScratchpadLoadCompletedRows = 0;
+        tailScratchpadSingleShotActive = noWaitPackedTail;
+        stats.tailScratchpadMissCount++;
+        stats.tailScratchpadLoadCount++;
+        stats.tailPackOnceCount++;
+        stats.tailScratchpadCapacityBytes = std::max<uint64_t>(
+            static_cast<uint64_t>(totalBytes),
+            static_cast<uint64_t>(stats.tailScratchpadCapacityBytes.value()));
+        stats.tailScratchpadOccupancyPeak = std::max<uint64_t>(
+            static_cast<uint64_t>(totalBytes),
+            static_cast<uint64_t>(stats.tailScratchpadOccupancyPeak.value()));
+        stats.tailPackBytes += totalBytes;
+        if (noWaitPackedTail) {
+            stats.btailPreloadCount++;
+            btailPreloadIssuedTick = curTick();
+            DPRINTF(MatrixFlowTiming,
+                    "btailPreloadIssued: packedSource=%#llx rows=%u cols=%u "
+                    "bytes=%llu tick=%llu\n",
+                    static_cast<unsigned long long>(targetBaseB),
+                    targetRows, targetCols,
+                    static_cast<unsigned long long>(totalBytes),
+                    static_cast<unsigned long long>(curTick()));
+            DPRINTF(MatrixFlowTiming,
+                    "btailPreloadBegin: packedSource=%#llx tick=%llu\n",
+                    static_cast<unsigned long long>(targetBaseB),
+                    static_cast<unsigned long long>(curTick()));
+        }
+        DPRINTF(MatrixFlowTiming,
+                "tailScratchpadLoad(B-tail): baseB=%#llx rows=%u cols=%u "
+                "bytes=%llu batchIndex=%u\n",
+                static_cast<unsigned long long>(tailScratchpadBaseB),
+                tailScratchpadRows, tailScratchpadCols,
+                static_cast<unsigned long long>(totalBytes),
+                batchSubproblemIndex);
+        issueNextTailScratchpadRow();
+        return;
+    }
+
+    stats.tailScratchpadReuseCount += ctx.kTotal;
+    if (batchSubproblemIndex == 1) {
+        stats.rightEdgeServedFromTailScratchpadCount++;
+    } else if (batchSubproblemIndex == 3) {
+        stats.cornerServedFromTailScratchpadCount++;
+    }
+    DPRINTF(MatrixFlowTiming,
+            "tailScratchpadHit(B-tail): baseB=%#llx rows=%u cols=%u batchIndex=%u\n",
+            static_cast<unsigned long long>(tailScratchpadBaseB),
+            tailScratchpadRows, tailScratchpadCols, batchSubproblemIndex);
+    if (currentSubproblemUsesFusedEdges()) {
+        if (irregularFusedRightEdgeCleanTimingMode()) {
+            processPendingFusedRightTiles();
+            if (reqsIssuedA == 0 && reqsIssuedB == 0 &&
+                reqsCompletedA == 0 && reqsCompletedB == 0 &&
+                !computeDoneEvent.scheduled()) {
+                prepareOutputTile();
+                issueFetchATile();
+            }
+        } else {
+            issueATailScratchpadLoad();
+        }
+    } else {
+        prepareOutputTile();
+        issueFetchATile();
+    }
+}
+
+void
+MatrixFlowEngine::issueNextTailScratchpadRow()
+{
+    if (tailScratchpadLoadNextRow >= tailScratchpadRows) {
+        tailScratchpadLoading = false;
+        tailScratchpadValid = true;
+        if (tailScratchpadSingleShotActive && btailPreloadIssuedTick != 0 &&
+            curTick() >= btailPreloadIssuedTick) {
+            btailPreloadDoneTick = curTick();
+            const Tick latency = curTick() - btailPreloadIssuedTick;
+            stats.btailPreloadLatencyCycles += latency / clockPeriod();
+            if (bodyFirstUsefulWorkIssuedTick != 0) {
+                if (curTick() >= bodyFirstUsefulWorkIssuedTick) {
+                    stats.btailPreloadOverlapCycles +=
+                        (curTick() - bodyFirstUsefulWorkIssuedTick) /
+                        clockPeriod();
+                    stats.fusedRightActivationDelayCycles +=
+                        (curTick() - bodyFirstUsefulWorkIssuedTick) /
+                        clockPeriod();
+                } else {
+                    stats.btailPreloadLeadCycles +=
+                        (bodyFirstUsefulWorkIssuedTick - curTick()) /
+                        clockPeriod();
+                }
+            }
+            DPRINTF(MatrixFlowTiming,
+                    "btailPreloadDone: tick=%llu latencyCycles=%llu "
+                    "bodyFirstUsefulTick=%llu\n",
+                    static_cast<unsigned long long>(curTick()),
+                    static_cast<unsigned long long>(latency / clockPeriod()),
+                    static_cast<unsigned long long>(bodyFirstUsefulWorkIssuedTick));
+            if (!pendingFusedRightTiles.empty()) {
+                DPRINTF(MatrixFlowTiming,
+                        "fusedRightActivationReady: pending=%zu tick=%llu\n",
+                        pendingFusedRightTiles.size(),
+                        static_cast<unsigned long long>(curTick()));
+            }
+        }
+        stats.tailScratchpadReuseCount +=
+            tailScratchpadRows > 0 ? (tailScratchpadRows - 1) : 0;
+        if (batchSubproblemIndex == 1) {
+            stats.rightEdgeServedFromTailScratchpadCount++;
+        } else if (batchSubproblemIndex == 3) {
+            stats.cornerServedFromTailScratchpadCount++;
+        }
+        DPRINTF(MatrixFlowTiming,
+                "tailScratchpadReady: index=%u tick=%llu baseB=%#llx rows=%u cols=%u\n",
+                batchSubproblemIndex,
+                static_cast<unsigned long long>(curTick()),
+                static_cast<unsigned long long>(tailScratchpadBaseB),
+                tailScratchpadRows, tailScratchpadCols);
+        if (currentSubproblemUsesFusedEdges()) {
+            if (irregularFusedRightEdgeCleanTimingMode() ||
+                irregularNoWaitFusedRightMode()) {
+                processPendingFusedRightTiles();
+                if (reqsIssuedA == 0 && reqsIssuedB == 0 &&
+                    reqsCompletedA == 0 && reqsCompletedB == 0 &&
+                    !computeDoneEvent.scheduled()) {
+                    prepareOutputTile();
+                    issueFetchATile();
+                }
+            } else {
+                issueATailScratchpadLoad();
+            }
+        } else {
+            prepareOutputTile();
+            issueFetchATile();
+        }
+        return;
+    }
+
+    if (tailScratchpadSingleShotActive) {
+        const Addr totalBytes =
+            static_cast<Addr>(tailScratchpadRows) * tailScratchpadCols *
+            ctx.elemBytes;
+        auto [reqAddr, reqBytes, reqOffset] =
+            planReadRequest(tailScratchpadBaseB, totalBytes);
+        uint8_t *dmaDst = tailScratchpadBuffer.data();
+        if (reqBytes != totalBytes || reqOffset != 0) {
+            tailScratchpadBounceActive = true;
+            tailScratchpadReqAddr = reqAddr;
+            tailScratchpadReqBytes = reqBytes;
+            tailScratchpadRowBytes = totalBytes;
+            tailScratchpadReqOffset = reqOffset;
+            if (tailScratchpadBounceBuffer.size() < reqBytes) {
+                tailScratchpadBounceBuffer.resize(reqBytes);
+            }
+            dmaDst = tailScratchpadBounceBuffer.data();
+        } else {
+            tailScratchpadBounceActive = false;
+        }
+        phase = Phase::FetchB;
+        stats.totalDmaBytesRead += reqBytes;
+        stats.tailScratchpadBytesLoaded += reqBytes;
+        stats.rightEdgeDmaReadBytes += reqBytes;
+        DPRINTF(MatrixFlowTiming,
+                "btailPreloadSingleShotRead: addr=%#llx bytes=%llu tick=%llu\n",
+                static_cast<unsigned long long>(reqAddr),
+                static_cast<unsigned long long>(reqBytes),
+                static_cast<unsigned long long>(curTick()));
+        dmaPort.dmaAction(MemCmd::ReadReq, reqAddr, reqBytes,
+                          &tailScratchpadLoadCompleteEvent,
+                          dmaDst, 0);
+        return;
+    }
+
+    const uint32_t row = tailScratchpadLoadNextRow;
+    const Addr rowBytes = static_cast<Addr>(tailScratchpadCols) * ctx.elemBytes;
+    const uint32_t rowStride = currentSubproblemUsesFusedEdges() ?
+        irregularBatchRootLdb : ctx.ldb;
+    const Addr rowAddr = tailScratchpadBaseB +
+        static_cast<Addr>(row) * rowStride * ctx.elemBytes;
+    auto [reqAddr, reqBytes, reqOffset] = planReadRequest(rowAddr, rowBytes);
+    uint8_t *dmaDst = tailScratchpadBuffer.data() +
+                      static_cast<size_t>(row) * rowBytes;
+    if (reqBytes != rowBytes || reqOffset != 0) {
+        tailScratchpadBounceActive = true;
+        tailScratchpadReqAddr = reqAddr;
+        tailScratchpadReqBytes = reqBytes;
+        tailScratchpadRowBytes = rowBytes;
+        tailScratchpadReqOffset = reqOffset;
+        dmaDst = tailScratchpadBounceBuffer.data();
+    } else {
+        tailScratchpadBounceActive = false;
+    }
+    phase = Phase::FetchB;
+    stats.totalDmaBytesRead += reqBytes;
+    stats.tailScratchpadBytesLoaded += reqBytes;
+    if (currentSubproblemUsesFusedEdges() || batchSubproblemIndex == 1) {
+        stats.rightEdgeDmaReadBytes += reqBytes;
+    }
+    dmaPort.dmaAction(MemCmd::ReadReq, reqAddr, reqBytes,
+                      &tailScratchpadLoadCompleteEvent, dmaDst, 0);
+}
+
+void
+MatrixFlowEngine::onTailScratchpadLoadComplete()
+{
+    if (tailScratchpadSingleShotActive) {
+        if (tailScratchpadBounceActive) {
+            std::memcpy(tailScratchpadBuffer.data(),
+                        tailScratchpadBounceBuffer.data() +
+                            tailScratchpadReqOffset,
+                        tailScratchpadRowBytes);
+            tailScratchpadBounceActive = false;
+        }
+        tailScratchpadLoadCompletedRows = tailScratchpadRows;
+        tailScratchpadLoadNextRow = tailScratchpadRows;
+        issueNextTailScratchpadRow();
+        return;
+    }
+    if (tailScratchpadBounceActive) {
+        std::memcpy(tailScratchpadBuffer.data() +
+                        static_cast<size_t>(tailScratchpadLoadNextRow) *
+                            tailScratchpadRowBytes,
+                    tailScratchpadBounceBuffer.data() + tailScratchpadReqOffset,
+                    tailScratchpadRowBytes);
+        tailScratchpadBounceActive = false;
+    }
+    ++tailScratchpadLoadCompletedRows;
+    ++tailScratchpadLoadNextRow;
+    issueNextTailScratchpadRow();
+}
+
+void
+MatrixFlowEngine::issueATailScratchpadLoad()
+{
+    markBatchStepFirstWorkIssued();
+    panic_if(!currentSubproblemUsesFusedEdges(),
+             "%s: A-tail scratchpad requested outside fused-edges body\n",
+             name());
+
+    const uint32_t tailRows = irregularTailRows();
+    const Addr rowAddr =
+        matrixAAddr(ctx, irregularTailStartRow(), 0);
+    const Addr totalBytes =
+        static_cast<Addr>(tailRows) * ctx.kTotal * ctx.elemBytes;
+    if (aTailScratchpadValid && aTailScratchpadBaseA == rowAddr &&
+        aTailScratchpadRows == tailRows &&
+        aTailScratchpadCols == ctx.kTotal) {
+        if (!(irregularNoWaitFusedBottomMode() ||
+              irregularSingleFusedDescriptorCornerCollapseMode())) {
+            prepareOutputTile();
+            issueFetchATile();
+        }
+        return;
+    }
+    if (aTailScratchpadLoading) {
+        return;
+    }
+
+    aTailScratchpadValid = false;
+    aTailScratchpadLoading = true;
+    aTailScratchpadBaseA = rowAddr;
+    aTailScratchpadRows = tailRows;
+    aTailScratchpadCols = ctx.kTotal;
+    aTailScratchpadBuffer.assign(static_cast<size_t>(totalBytes), 0);
+    auto [reqAddr, reqBytes, reqOffset] = planReadRequest(rowAddr, totalBytes);
+    uint8_t *dmaDst = aTailScratchpadBuffer.data();
+    if (reqBytes != totalBytes || reqOffset != 0) {
+        aTailScratchpadBounceActive = true;
+        aTailScratchpadReqAddr = reqAddr;
+        aTailScratchpadReqBytes = reqBytes;
+        aTailScratchpadRowBytes = totalBytes;
+        aTailScratchpadReqOffset = reqOffset;
+        dmaDst = aTailScratchpadBounceBuffer.data();
+    } else {
+        aTailScratchpadBounceActive = false;
+    }
+    phase = Phase::FetchA;
+    stats.totalDmaBytesRead += reqBytes;
+    stats.bottomEdgeDmaReadBytes += reqBytes;
+    if (irregularNoWaitFusedBottomMode() ||
+        irregularSingleFusedDescriptorCornerCollapseMode()) {
+        atailPreloadIssuedTick = curTick();
+        stats.atailPreloadCount++;
+        DPRINTF(MatrixFlowTiming,
+                "atailPreloadIssued: addr=%#llx bytes=%llu tick=%llu\n",
+                static_cast<unsigned long long>(rowAddr),
+                static_cast<unsigned long long>(totalBytes),
+                static_cast<unsigned long long>(curTick()));
+        DPRINTF(MatrixFlowTiming,
+                "atailPreloadBegin: reqAddr=%#llx reqBytes=%llu tick=%llu\n",
+                static_cast<unsigned long long>(reqAddr),
+                static_cast<unsigned long long>(reqBytes),
+                static_cast<unsigned long long>(curTick()));
+    }
+    dmaPort.dmaAction(MemCmd::ReadReq, reqAddr, reqBytes,
+                      &aTailScratchpadLoadCompleteEvent, dmaDst, 0);
+}
+
+void
+MatrixFlowEngine::onATailScratchpadLoadComplete()
+{
+    if (aTailScratchpadBounceActive) {
+        std::memcpy(aTailScratchpadBuffer.data(),
+                    aTailScratchpadBounceBuffer.data() + aTailScratchpadReqOffset,
+                    aTailScratchpadRowBytes);
+        aTailScratchpadBounceActive = false;
+    }
+    aTailScratchpadLoading = false;
+    aTailScratchpadValid = true;
+    if (irregularNoWaitFusedBottomMode() ||
+        irregularSingleFusedDescriptorCornerCollapseMode()) {
+        atailPreloadDoneTick = curTick();
+        const Tick latency =
+            atailPreloadIssuedTick != 0 && atailPreloadDoneTick >=
+                                               atailPreloadIssuedTick
+                ? atailPreloadDoneTick - atailPreloadIssuedTick
+                : 0;
+        stats.atailPreloadLatencyCycles += latency / clockPeriod();
+        if (bodyFirstUsefulWorkIssuedTick != 0) {
+            if (atailPreloadDoneTick <= bodyFirstUsefulWorkIssuedTick) {
+                stats.atailPreloadLeadCycles +=
+                    (bodyFirstUsefulWorkIssuedTick - atailPreloadDoneTick) /
+                    clockPeriod();
+            } else {
+                stats.atailPreloadOverlapCycles +=
+                    std::min(latency, atailPreloadDoneTick -
+                                          bodyFirstUsefulWorkIssuedTick) /
+                    clockPeriod();
+                stats.fusedBottomActivationDelayCycles +=
+                    (atailPreloadDoneTick - bodyFirstUsefulWorkIssuedTick) /
+                    clockPeriod();
+            }
+        }
+        DPRINTF(MatrixFlowTiming,
+                "atailPreloadDone: tick=%llu latencyCycles=%llu "
+                "bodyFirstUsefulTick=%llu\n",
+                static_cast<unsigned long long>(curTick()),
+                static_cast<unsigned long long>(latency / clockPeriod()),
+                static_cast<unsigned long long>(bodyFirstUsefulWorkIssuedTick));
+        if (!pendingFusedBottomTiles.empty()) {
+            DPRINTF(MatrixFlowTiming,
+                    "fusedBottomActivationReady: pending=%zu tick=%llu\n",
+                    pendingFusedBottomTiles.size(),
+                    static_cast<unsigned long long>(curTick()));
+        }
+        processPendingFusedBottomTiles();
+        return;
+    }
+    prepareOutputTile();
+    issueFetchATile();
+}
+
+void
+MatrixFlowEngine::populateBTileFromTailScratchpad()
+{
+    const Addr rowBytes = static_cast<Addr>(ctx.curTileN) * ctx.elemBytes;
+    for (uint32_t r = 0; r < ctx.curTileK; ++r) {
+        const size_t srcOffset =
+            (static_cast<size_t>(ctx.k + r) * tailScratchpadCols) * ctx.elemBytes;
+        std::memcpy(tileBBuffer.data() + static_cast<size_t>(r) * rowBytes,
+                    tailScratchpadBuffer.data() + srcOffset, rowBytes);
+        currentBRowState[r] = BRowState::ReadyFromNormal;
+        currentBProtectionClass[r] = BProtectionClass::None;
+        ++reqsIssuedB;
+        ++reqsCompletedB;
+        stats.tailScratchpadHitCount++;
+    }
+    targetReqsB = ctx.curTileK;
+}
+
+void
+MatrixFlowEngine::enqueuePendingFusedRightTile()
+{
+    PendingFusedRightTile pending;
+    pending.tileI = ctx.i;
+    pending.tileK = ctx.k;
+    pending.curTileM = ctx.curTileM;
+    pending.curTileK = ctx.curTileK;
+    const auto *tileA = reinterpret_cast<const uint32_t *>(tileABuffer.data());
+    pending.tileA.assign(tileA, tileA + static_cast<size_t>(ctx.curTileM) *
+        ctx.curTileK);
+    pendingFusedRightTiles.emplace_back(std::move(pending));
+    stats.fusedRightPendingCount++;
+    DPRINTF(MatrixFlowTiming,
+            "fusedRightPending set: tile=(%u,%u,%u) pendingCount=%zu tick=%llu\n",
+            ctx.curTileM, 1U, ctx.curTileK, pendingFusedRightTiles.size(),
+            static_cast<unsigned long long>(curTick()));
+    DPRINTF(MatrixFlowTiming,
+            "fusedRightEdgeDeferred: tile=(%u,%u,%u) pendingCount=%zu\n",
+            ctx.curTileM, 1U, ctx.curTileK, pendingFusedRightTiles.size());
+}
+
+void
+MatrixFlowEngine::accumulateFusedRightEdgeFromBufferedTile(
+    const PendingFusedRightTile &pending)
+{
+    auto *dstBase = reinterpret_cast<uint32_t *>(outputHoldBuffer.data());
+    const auto *tailB =
+        reinterpret_cast<const uint32_t *>(tailScratchpadBuffer.data());
+    const uint32_t tailStartCol = irregularTailStartCol();
+    const uint32_t tailCols = irregularTailCols();
+    for (uint32_t m = 0; m < pending.curTileM; ++m) {
+        for (uint32_t tc = 0; tc < tailCols; ++tc) {
+            uint64_t acc =
+                dstBase[(static_cast<size_t>(pending.tileI + m) *
+                         outputHoldCols) +
+                        (tailStartCol + tc)];
+            for (uint32_t kk = 0; kk < pending.curTileK; ++kk) {
+                acc += static_cast<uint64_t>(
+                           pending.tileA[m * pending.curTileK + kk]) *
+                       static_cast<uint64_t>(
+                           tailB[(static_cast<size_t>(pending.tileK + kk) *
+                                  tailScratchpadCols) + tc]);
+            }
+            dstBase[(static_cast<size_t>(pending.tileI + m) * outputHoldCols) +
+                    (tailStartCol + tc)] = static_cast<uint32_t>(acc);
+        }
+    }
+    const uint64_t cycles =
+        estimateTileCycles(pending.curTileM, tailCols, pending.curTileK);
+    stats.rightEdgeServedFromAReuseCount++;
+    stats.fusedRightActivatedCount++;
+    stats.rightEdgeAReuseBytesSaved +=
+        static_cast<uint64_t>(pending.curTileM) * pending.curTileK *
+        ctx.elemBytes;
+    stats.rightEdgeActiveTimeCycles += cycles;
+    stats.rightEdgeComputeCycles += cycles;
+    DPRINTF(MatrixFlowTiming,
+            "fusedRightEdgeAReuse fired: tile=(%u,%u,%u) savedABytes=%llu cycles=%llu deferred=1\n",
+            pending.curTileM, 1U, pending.curTileK,
+            static_cast<unsigned long long>(
+                static_cast<uint64_t>(pending.curTileM) *
+                pending.curTileK * ctx.elemBytes),
+            static_cast<unsigned long long>(cycles));
+}
+
+void
+MatrixFlowEngine::processPendingFusedRightTiles()
+{
+    if (!tailScratchpadValid || pendingFusedRightTiles.empty()) {
+        return;
+    }
+    for (const auto &pending : pendingFusedRightTiles) {
+        DPRINTF(MatrixFlowTiming,
+                "fusedRightActivationAtKTile: tileI=%u tileK=%u tick=%llu\n",
+                pending.tileI, pending.tileK,
+                static_cast<unsigned long long>(curTick()));
+        accumulateFusedRightEdgeFromBufferedTile(pending);
+    }
+    pendingFusedRightTiles.clear();
+}
+
+void
+MatrixFlowEngine::accumulateFusedRightEdgeFromCurrentATile()
+{
+    if (!currentSubproblemUsesFusedEdges() ||
+        ctx.curTileM == 0 || ctx.curTileK == 0) {
+        return;
+    }
+
+    // Right-edge contribution depends on (i,k) and the packed B-tail, but not
+    // on the current body j-tile. Only accumulate it once per (i,k) sweep.
+    if (ctx.j != 0) {
+        return;
+    }
+
+    if (!tailScratchpadValid) {
+        if (irregularFusedRightEdgeCleanTimingMode()) {
+            enqueuePendingFusedRightTile();
+        }
+        return;
+    }
+
+    auto *tileA = reinterpret_cast<const uint32_t *>(tileABuffer.data());
+    auto *dstBase = reinterpret_cast<uint32_t *>(outputHoldBuffer.data());
+    const auto *tailB = reinterpret_cast<const uint32_t *>(tailScratchpadBuffer.data());
+    const uint32_t tailStartCol = irregularTailStartCol();
+    const uint32_t tailCols = irregularTailCols();
+    for (uint32_t m = 0; m < ctx.curTileM; ++m) {
+        for (uint32_t tc = 0; tc < tailCols; ++tc) {
+            uint64_t acc =
+                dstBase[(static_cast<size_t>(ctx.i + m) * outputHoldCols) +
+                        (tailStartCol + tc)];
+            for (uint32_t kk = 0; kk < ctx.curTileK; ++kk) {
+                acc += static_cast<uint64_t>(tileA[m * ctx.curTileK + kk]) *
+                       static_cast<uint64_t>(
+                           tailB[(static_cast<size_t>(ctx.k + kk) *
+                                  tailScratchpadCols) + tc]);
+            }
+            dstBase[(static_cast<size_t>(ctx.i + m) * outputHoldCols) +
+                    (tailStartCol + tc)] = static_cast<uint32_t>(acc);
+        }
+    }
+    const uint64_t cycles =
+        estimateTileCycles(ctx.curTileM, tailCols, ctx.curTileK);
+    stats.rightEdgeServedFromAReuseCount++;
+    stats.rightEdgeAReuseBytesSaved +=
+        static_cast<uint64_t>(ctx.curTileM) * ctx.curTileK * ctx.elemBytes;
+    stats.rightEdgeActiveTimeCycles += cycles;
+    stats.rightEdgeComputeCycles += cycles;
+    DPRINTF(MatrixFlowTiming,
+            "fusedRightEdgeAReuse fired: tile=(%u,%u,%u) savedABytes=%llu cycles=%llu\n",
+            ctx.curTileM, 1U, ctx.curTileK,
+            static_cast<unsigned long long>(
+                static_cast<uint64_t>(ctx.curTileM) * ctx.curTileK *
+                ctx.elemBytes),
+            static_cast<unsigned long long>(cycles));
+}
+
+void
+MatrixFlowEngine::enqueuePendingFusedBottomTile()
+{
+    PendingFusedBottomTile pending;
+    pending.tileJ = ctx.j;
+    pending.tileK = ctx.k;
+    pending.curTileN = ctx.curTileN;
+    pending.curTileK = ctx.curTileK;
+    const auto *tileB = reinterpret_cast<const uint32_t *>(tileBBuffer.data());
+    pending.tileB.assign(tileB, tileB + static_cast<size_t>(ctx.curTileK) *
+        ctx.curTileN);
+    pendingFusedBottomTiles.emplace_back(std::move(pending));
+    stats.fusedBottomPendingCount++;
+    DPRINTF(MatrixFlowTiming,
+            "fusedBottomPending set: tile=(%u,%u,%u) pendingCount=%zu tick=%llu\n",
+            1U, ctx.curTileN, ctx.curTileK, pendingFusedBottomTiles.size(),
+            static_cast<unsigned long long>(curTick()));
+}
+
+void
+MatrixFlowEngine::accumulateFusedBottomEdgeFromBufferedTile(
+    const PendingFusedBottomTile &pending)
+{
+    const auto *tailA =
+        reinterpret_cast<const uint32_t *>(aTailScratchpadBuffer.data());
+    auto *dstBase = reinterpret_cast<uint32_t *>(outputHoldBuffer.data());
+    const uint32_t tailStartRow = irregularTailStartRow();
+    const uint32_t tailRows = irregularTailRows();
+    for (uint32_t tr = 0; tr < tailRows; ++tr) {
+        for (uint32_t n = 0; n < pending.curTileN; ++n) {
+            uint64_t acc =
+                dstBase[(static_cast<size_t>(tailStartRow + tr) *
+                         outputHoldCols) +
+                        (pending.tileJ + n)];
+            for (uint32_t kk = 0; kk < pending.curTileK; ++kk) {
+                acc += static_cast<uint64_t>(
+                           tailA[(static_cast<size_t>(tr) *
+                                  aTailScratchpadCols) +
+                                 (pending.tileK + kk)]) *
+                       static_cast<uint64_t>(
+                           pending.tileB[kk * pending.curTileN + n]);
+            }
+            dstBase[(static_cast<size_t>(tailStartRow + tr) * outputHoldCols) +
+                    (pending.tileJ + n)] = static_cast<uint32_t>(acc);
+        }
+    }
+    const uint64_t cycles =
+        estimateTileCycles(tailRows, pending.curTileN, pending.curTileK);
+    stats.bottomEdgeServedFromBReuseCount++;
+    stats.fusedBottomActivatedCount++;
+    stats.bottomEdgeBReuseBytesSaved +=
+        static_cast<uint64_t>(pending.curTileN) * pending.curTileK *
+        ctx.elemBytes;
+    stats.bottomEdgeActiveTimeCycles += cycles;
+    stats.bottomEdgeComputeCycles += cycles;
+    DPRINTF(MatrixFlowTiming,
+            "fusedBottomEdgeBReuse fired: tile=(%u,%u,%u) savedBBytes=%llu cycles=%llu deferred=1\n",
+            1U, pending.curTileN, pending.curTileK,
+            static_cast<unsigned long long>(
+                static_cast<uint64_t>(pending.curTileN) *
+                pending.curTileK * ctx.elemBytes),
+            static_cast<unsigned long long>(cycles));
+}
+
+void
+MatrixFlowEngine::processPendingFusedBottomTiles()
+{
+    if (!aTailScratchpadValid || pendingFusedBottomTiles.empty()) {
+        return;
+    }
+    for (const auto &pending : pendingFusedBottomTiles) {
+        DPRINTF(MatrixFlowTiming,
+                "fusedBottomActivationAtKTile: tileJ=%u tileK=%u tick=%llu\n",
+                pending.tileJ, pending.tileK,
+                static_cast<unsigned long long>(curTick()));
+        accumulateFusedBottomEdgeFromBufferedTile(pending);
+    }
+    pendingFusedBottomTiles.clear();
+}
+
+void
+MatrixFlowEngine::accumulateFusedBottomEdgeFromCurrentBTile()
+{
+    if (!currentSubproblemUsesFusedEdges() ||
+        ctx.curTileN == 0 || ctx.curTileK == 0) {
+        return;
+    }
+    if (ctx.i != 0) {
+        return;
+    }
+    if (!aTailScratchpadValid) {
+        if (irregularNoWaitFusedBottomMode() ||
+            irregularSingleFusedDescriptorCornerCollapseMode()) {
+            enqueuePendingFusedBottomTile();
+        }
+        return;
+    }
+    if (irregularNoWaitFusedBottomMode() ||
+        irregularSingleFusedDescriptorCornerCollapseMode()) {
+        DPRINTF(MatrixFlowTiming,
+                "fusedBottomActivationReady: pending=0 tick=%llu\n",
+                static_cast<unsigned long long>(curTick()));
+        DPRINTF(MatrixFlowTiming,
+                "fusedBottomActivationAtKTile: tileJ=%u tileK=%u tick=%llu\n",
+                ctx.j, ctx.k, static_cast<unsigned long long>(curTick()));
+    }
+
+    const auto *tailA = reinterpret_cast<const uint32_t *>(aTailScratchpadBuffer.data());
+    auto *tileB = reinterpret_cast<const uint32_t *>(tileBBuffer.data());
+    auto *dstBase = reinterpret_cast<uint32_t *>(outputHoldBuffer.data());
+    const uint32_t tailStartRow = irregularTailStartRow();
+    const uint32_t tailRows = irregularTailRows();
+    for (uint32_t tr = 0; tr < tailRows; ++tr) {
+        for (uint32_t n = 0; n < ctx.curTileN; ++n) {
+            uint64_t acc =
+                dstBase[(static_cast<size_t>(tailStartRow + tr) *
+                         outputHoldCols) +
+                        (ctx.j + n)];
+            for (uint32_t kk = 0; kk < ctx.curTileK; ++kk) {
+                acc += static_cast<uint64_t>(
+                           tailA[(static_cast<size_t>(tr) *
+                                  aTailScratchpadCols) +
+                                 (ctx.k + kk)]) *
+                       static_cast<uint64_t>(tileB[kk * ctx.curTileN + n]);
+            }
+            dstBase[(static_cast<size_t>(tailStartRow + tr) * outputHoldCols) +
+                    (ctx.j + n)] = static_cast<uint32_t>(acc);
+        }
+    }
+    const uint64_t cycles =
+        estimateTileCycles(tailRows, ctx.curTileN, ctx.curTileK);
+    stats.bottomEdgeServedFromBReuseCount++;
+    stats.fusedBottomActivatedCount++;
+    stats.bottomEdgeBReuseBytesSaved +=
+        static_cast<uint64_t>(ctx.curTileN) * ctx.curTileK * ctx.elemBytes;
+    stats.bottomEdgeActiveTimeCycles += cycles;
+    stats.bottomEdgeComputeCycles += cycles;
+    DPRINTF(MatrixFlowTiming,
+            "fusedBottomEdgeBReuse fired: tile=(%u,%u,%u) savedBBytes=%llu cycles=%llu\n",
+            1U, ctx.curTileN, ctx.curTileK,
+            static_cast<unsigned long long>(
+                static_cast<uint64_t>(ctx.curTileN) * ctx.curTileK *
+                ctx.elemBytes),
+            static_cast<unsigned long long>(cycles));
+}
+
+void
+MatrixFlowEngine::accumulateFusedCornerFromCurrentTiles()
+{
+    if (!currentSubproblemUsesFusedEdges() || !aTailScratchpadValid ||
+        !tailScratchpadValid || ctx.curTileK == 0) {
+        return;
+    }
+    if (irregularSingleFusedDescriptorCornerCollapseMode() &&
+        (ctx.i != 0 || ctx.j != 0)) {
+        return;
+    }
+
+    const auto *tailA = reinterpret_cast<const uint32_t *>(aTailScratchpadBuffer.data());
+    const auto *tailB = reinterpret_cast<const uint32_t *>(tailScratchpadBuffer.data());
+    auto *dstBase = reinterpret_cast<uint32_t *>(outputHoldBuffer.data());
+    const uint32_t tailStartRow = irregularTailStartRow();
+    const uint32_t tailStartCol = irregularTailStartCol();
+    const uint32_t tailRows = irregularTailRows();
+    const uint32_t tailCols = irregularTailCols();
+    for (uint32_t tr = 0; tr < tailRows; ++tr) {
+        for (uint32_t tc = 0; tc < tailCols; ++tc) {
+            uint64_t acc =
+                dstBase[(static_cast<size_t>(tailStartRow + tr) *
+                         outputHoldCols) +
+                        (tailStartCol + tc)];
+            for (uint32_t kk = 0; kk < ctx.curTileK; ++kk) {
+                acc += static_cast<uint64_t>(
+                           tailA[(static_cast<size_t>(tr) *
+                                  aTailScratchpadCols) +
+                                 (ctx.k + kk)]) *
+                       static_cast<uint64_t>(
+                           tailB[(static_cast<size_t>(ctx.k + kk) *
+                                  tailScratchpadCols) + tc]);
+            }
+            dstBase[(static_cast<size_t>(tailStartRow + tr) * outputHoldCols) +
+                    (tailStartCol + tc)] = static_cast<uint32_t>(acc);
+        }
+    }
+    if (irregularSingleFusedDescriptorCornerCollapseMode()) {
+        const uint64_t cycles =
+            estimateTileCycles(tailRows, tailCols, ctx.curTileK);
+        if (!cornerCollapseActivatedThisBatch) {
+            cornerCollapseActivatedThisBatch = true;
+            stats.cornerCollapseCount++;
+            DPRINTF(MatrixFlowTiming,
+                    "cornerCollapseActivated: tick=%llu bottomRow=%u tailCol=%u\n",
+                    static_cast<unsigned long long>(curTick()),
+                    tailStartRow, tailStartCol);
+        }
+        stats.cornerServedFromTailOperandsCount++;
+        stats.cornerCollapsedActiveCycles += cycles;
+        DPRINTF(MatrixFlowTiming,
+                "cornerServedFromTailOperands: tile=(%u,%u,%u) cycles=%llu tick=%llu\n",
+                tailRows, tailCols,
+                ctx.curTileK,
+                static_cast<unsigned long long>(cycles),
+                static_cast<unsigned long long>(curTick()));
+    }
+}
+
+const char *
+MatrixFlowEngine::outputTileClassName(OutputTileClass tileClass) const
+{
+    switch (tileClass) {
+      case OutputTileClass::Interior:
+        return "INTERIOR";
+      case OutputTileClass::RightBoundary:
+        return "RIGHT_BOUNDARY";
+      case OutputTileClass::BottomBoundary:
+        return "BOTTOM_BOUNDARY";
+      case OutputTileClass::CornerBoundary:
+        return "CORNER_BOUNDARY";
+    }
+    return "UNKNOWN";
+}
+
+void
+MatrixFlowEngine::precomputeStaticOutputTileClassification()
+{
+    if (!irregularStaticOutputTileClassifierBoundaryHoldMode() ||
+        !currentSubproblemUsesOutputHold() || outputHoldRows == 0 ||
+        outputHoldCols == 0) {
+        return;
+    }
+
+    staticOutputTileClassifierBeginTick = curTick();
+    DPRINTF(MatrixFlowTiming,
+            "outputTileClassifierBegin: rows=%u cols=%u tileDim=%u tick=%llu\n",
+            outputHoldRows, outputHoldCols,
+            static_cast<uint32_t>(kMaxTileDim),
+            static_cast<unsigned long long>(
+                staticOutputTileClassifierBeginTick));
+
+    staticOutputTileDim = static_cast<uint32_t>(kMaxTileDim);
+    staticOutputTileRows =
+        (outputHoldRows + staticOutputTileDim - 1) / staticOutputTileDim;
+    staticOutputTileCols =
+        (outputHoldCols + staticOutputTileDim - 1) / staticOutputTileDim;
+    const uint32_t residueRows = outputHoldRows % staticOutputTileDim;
+    const uint32_t residueCols = outputHoldCols % staticOutputTileDim;
+    staticOutputMainRows =
+        residueRows == 0 ? outputHoldRows : outputHoldRows - residueRows;
+    staticOutputMainCols =
+        residueCols == 0 ? outputHoldCols : outputHoldCols - residueCols;
+    staticInteriorTileCount = 0;
+    staticRightBoundaryTileCount = 0;
+    staticBottomBoundaryTileCount = 0;
+    staticCornerBoundaryTileCount = 0;
+    staticOutputTileClasses.assign(
+        static_cast<size_t>(staticOutputTileRows) * staticOutputTileCols,
+        OutputTileClass::Interior);
+
+    for (uint32_t ti = 0; ti < staticOutputTileRows; ++ti) {
+        const uint32_t rowStart = ti * staticOutputTileDim;
+        const uint32_t rows =
+            std::min(staticOutputTileDim, outputHoldRows - rowStart);
+        const bool bottom = rowStart + rows > staticOutputMainRows;
+        for (uint32_t tj = 0; tj < staticOutputTileCols; ++tj) {
+            const uint32_t colStart = tj * staticOutputTileDim;
+            const uint32_t cols =
+                std::min(staticOutputTileDim, outputHoldCols - colStart);
+            const bool right = colStart + cols > staticOutputMainCols;
+            OutputTileClass tileClass = OutputTileClass::Interior;
+            if (right && bottom) {
+                tileClass = OutputTileClass::CornerBoundary;
+                staticCornerBoundaryTileCount++;
+            } else if (right) {
+                tileClass = OutputTileClass::RightBoundary;
+                staticRightBoundaryTileCount++;
+            } else if (bottom) {
+                tileClass = OutputTileClass::BottomBoundary;
+                staticBottomBoundaryTileCount++;
+            } else {
+                staticInteriorTileCount++;
+            }
+            staticOutputTileClasses[static_cast<size_t>(ti) *
+                                    staticOutputTileCols + tj] = tileClass;
+        }
+    }
+
+    staticOutputTileClassifierEndTick = curTick();
+    staticOutputTileClassifierValid = true;
+    stats.interiorTileCount += staticInteriorTileCount;
+    stats.rightBoundaryTileCount += staticRightBoundaryTileCount;
+    stats.bottomBoundaryTileCount += staticBottomBoundaryTileCount;
+    stats.cornerBoundaryTileCount += staticCornerBoundaryTileCount;
+    stats.boundaryTileHoldCount +=
+        staticRightBoundaryTileCount + staticBottomBoundaryTileCount +
+        staticCornerBoundaryTileCount;
+    if (staticOutputTileClassifierEndTick >=
+        staticOutputTileClassifierBeginTick) {
+        stats.tileClassifierSetupCycles +=
+            (staticOutputTileClassifierEndTick -
+             staticOutputTileClassifierBeginTick) / clockPeriod();
+    }
+    DPRINTF(MatrixFlowTiming,
+            "outputTileClassifierEnd: tileRows=%u tileCols=%u mainRows=%u mainCols=%u "
+            "interiorTileCount=%u rightBoundaryTileCount=%u "
+            "bottomBoundaryTileCount=%u cornerBoundaryTileCount=%u "
+            "setupCycles=%llu hotPathChecks=0 tick=%llu\n",
+            staticOutputTileRows, staticOutputTileCols,
+            staticOutputMainRows, staticOutputMainCols,
+            staticInteriorTileCount, staticRightBoundaryTileCount,
+            staticBottomBoundaryTileCount, staticCornerBoundaryTileCount,
+            static_cast<unsigned long long>(
+                (staticOutputTileClassifierEndTick -
+                 staticOutputTileClassifierBeginTick) / clockPeriod()),
+            static_cast<unsigned long long>(staticOutputTileClassifierEndTick));
+    DPRINTF(MatrixFlowTiming,
+            "boundaryTileHold: right=%u bottom=%u corner=%u total=%u source=static\n",
+            staticRightBoundaryTileCount, staticBottomBoundaryTileCount,
+            staticCornerBoundaryTileCount,
+            staticRightBoundaryTileCount + staticBottomBoundaryTileCount +
+                staticCornerBoundaryTileCount);
+}
+
+MatrixFlowEngine::OutputTileClass
+MatrixFlowEngine::outputTileClassForRegion(uint32_t rowStart,
+                                           uint32_t colStart,
+                                           uint32_t rows,
+                                           uint32_t cols)
+{
+    if (staticOutputTileClassifierValid && staticOutputTileDim != 0 &&
+        rowStart < outputHoldRows && colStart < outputHoldCols) {
+        const uint32_t ti = rowStart / staticOutputTileDim;
+        const uint32_t tj = colStart / staticOutputTileDim;
+        const size_t idx =
+            static_cast<size_t>(ti) * staticOutputTileCols + tj;
+        if (ti < staticOutputTileRows && tj < staticOutputTileCols &&
+            idx < staticOutputTileClasses.size()) {
+            return staticOutputTileClasses[idx];
+        }
+    }
+
+    stats.tileClassifierHotPathChecks++;
+    const uint32_t boundaryRow = outputHoldRows - 1;
+    const uint32_t boundaryCol = outputHoldCols - 1;
+    const bool bottom = rowStart + rows > boundaryRow;
+    const bool right = colStart + cols > boundaryCol;
+    if (right && bottom) {
+        return OutputTileClass::CornerBoundary;
+    }
+    if (right) {
+        return OutputTileClass::RightBoundary;
+    }
+    if (bottom) {
+        return OutputTileClass::BottomBoundary;
+    }
+    return OutputTileClass::Interior;
+}
+
+uint32_t
+MatrixFlowEngine::earlyBodyWritebackRowWindow(
+    const OutputWriteRegion &region) const
+{
+    if (bodyInteriorWritebackStripeRowsConfig == 0 ||
+        bodyInteriorWritebackMaxOutstandingStripesConfig == 0) {
+        return kMaxInFlight;
+    }
+
+    const uint32_t stripeRows =
+        std::max<uint32_t>(1, std::min(region.rows,
+                                        bodyInteriorWritebackStripeRowsConfig));
+    const uint64_t windowRows = static_cast<uint64_t>(stripeRows) *
+        bodyInteriorWritebackMaxOutstandingStripesConfig;
+    return std::max<uint32_t>(
+        1,
+        static_cast<uint32_t>(
+            std::min<uint64_t>(kMaxInFlight, windowRows)));
+}
+
+void
+MatrixFlowEngine::storeCurrentTileToOutputHold()
+{
+    const Addr rowBytes = static_cast<Addr>(ctx.curTileN) * ctx.elemBytes;
+    auto *src = tileCBuffer.data();
+    for (uint32_t r = 0; r < ctx.curTileM; ++r) {
+        const uint32_t dstRow = currentSubproblemRowBase + ctx.i + r;
+        const uint32_t dstCol = currentSubproblemColBase + ctx.j;
+        auto *dst = outputHoldBuffer.data() +
+                    ((static_cast<size_t>(dstRow) * outputHoldCols) + dstCol) *
+                        ctx.elemBytes;
+        std::memcpy(dst, src + static_cast<size_t>(r) * rowBytes, rowBytes);
+    }
+    stats.outputHoldStoreCount++;
+    stats.outputHoldBytesStored +=
+        static_cast<uint64_t>(ctx.curTileM) * ctx.curTileN * ctx.elemBytes;
+    stats.epilogueMergeCount++;
+    if (irregularBoundaryOnlyHoldEarlyBodyWritebackMode() &&
+        currentTileIsInteriorOutputForEarlyWriteback()) {
+        enqueueEarlyBodyInteriorWritebackForCurrentTile();
+        maybeEnqueueEarlyBottomBoundaryWritebackForCurrentTile();
+    }
+}
+
+bool
+MatrixFlowEngine::currentTileIsInteriorOutputForEarlyWriteback()
+{
+    if (!currentSubproblemUsesOutputHold() || outputHoldRows == 0 ||
+        outputHoldCols == 0 || ctx.curTileM == 0 || ctx.curTileN == 0) {
+        return false;
+    }
+    const uint32_t rowStart = currentSubproblemRowBase + ctx.i;
+    const uint32_t colStart = currentSubproblemColBase + ctx.j;
+    const OutputTileClass tileClass = outputTileClassForRegion(
+        rowStart, colStart, ctx.curTileM, ctx.curTileN);
+    if (irregularStaticOutputTileClassifierBoundaryHoldMode()) {
+        DPRINTF(MatrixFlowTiming,
+                "outputTileClass: %s row=%u col=%u rows=%u cols=%u source=%s\n",
+                outputTileClassName(tileClass), rowStart, colStart,
+                ctx.curTileM, ctx.curTileN,
+                staticOutputTileClassifierValid ? "static" : "fallback");
+    }
+    return tileClass == OutputTileClass::Interior;
+}
+
+void
+MatrixFlowEngine::maybeEnqueueEarlyBottomBoundaryWritebackForCurrentTile()
+{
+    if (!irregularBoundaryWritebackCoalescingMode() ||
+        !staticOutputTileClassifierValid || outputHoldRows == 0 ||
+        outputHoldCols == 0 || ctx.i != 0 || ctx.curTileN == 0) {
+        return;
+    }
+    const uint32_t colStart = currentSubproblemColBase + ctx.j;
+    if (colStart >= staticOutputMainCols ||
+        colStart + ctx.curTileN > staticOutputMainCols) {
+        return;
+    }
+    if (irregularStreamingBodyWritebackMode() &&
+        colStart + ctx.curTileN != staticOutputMainCols) {
+        return;
+    }
+
+    OutputWriteRegion region;
+    region.rowStart = outputHoldRows - 1;
+    region.colStart =
+        irregularStreamingBodyWritebackMode() ? 0 : colStart;
+    region.rows = 1;
+    region.cols = irregularStreamingBodyWritebackMode() ?
+        outputHoldCols : ctx.curTileN;
+    if (!irregularStreamingBodyWritebackMode() &&
+        colStart + ctx.curTileN == staticOutputMainCols &&
+        staticOutputMainCols < outputHoldCols) {
+        region.cols += outputHoldCols - staticOutputMainCols;
+    }
+    region.interiorCols = 0;
+    region.boundary = true;
+    region.earlyBottomBoundary = true;
+    earlyBodyWritebackQueue.push_back(region);
+    coalescedBottomBoundaryCovered =
+        coalescedBottomBoundaryCovered ||
+        (colStart + region.cols >= outputHoldCols);
+    stats.boundaryBottomEarlyWritebackCount++;
+    stats.boundaryBottomEarlyWritebackBytes +=
+        static_cast<uint64_t>(region.cols) * ctx.elemBytes;
+    DPRINTF(MatrixFlowTiming,
+            "boundaryBottomEarlyWriteback: row=%u col=%u cols=%u bytes=%llu tick=%llu\n",
+            region.rowStart, region.colStart, region.cols,
+            static_cast<unsigned long long>(
+                static_cast<uint64_t>(region.cols) * ctx.elemBytes),
+            static_cast<unsigned long long>(curTick()));
+    tryStartNextEarlyBodyInteriorWriteback();
+}
+
+void
+MatrixFlowEngine::enqueueEarlyBodyInteriorWritebackForCurrentTile()
+{
+    const uint32_t rowStart = currentSubproblemRowBase + ctx.i;
+    const uint32_t colStart = currentSubproblemColBase + ctx.j;
+    if (irregularStreamingBodyWritebackMode() &&
+        staticOutputTileClassifierValid) {
+        if (colStart + ctx.curTileN < staticOutputMainCols) {
+            DPRINTF(MatrixFlowTiming,
+                    "streamingBodyWritebackDeferred: row=%u col=%u rows=%u cols=%u reason=wait_for_row_band_right_tile tick=%llu\n",
+                    rowStart, colStart, ctx.curTileM, ctx.curTileN,
+                    static_cast<unsigned long long>(curTick()));
+            return;
+        }
+    }
+
+    OutputWriteRegion region;
+    region.rowStart = rowStart;
+    region.colStart = colStart;
+    region.rows = ctx.curTileM;
+    region.cols = ctx.curTileN;
+    region.interiorCols = ctx.curTileN;
+    if (irregularStreamingBodyWritebackMode() &&
+        staticOutputTileClassifierValid &&
+        region.colStart + region.cols == staticOutputMainCols) {
+        region.colStart = 0;
+        region.cols = outputHoldCols;
+        region.interiorCols = staticOutputMainCols;
+        region.bulkContiguous = true;
+        region.includesRightBoundary = staticOutputMainCols < outputHoldCols;
+        coalescedRightBoundaryCovered =
+            coalescedRightBoundaryCovered ||
+            (region.rowStart + region.rows >= staticOutputMainRows);
+        if (region.includesRightBoundary) {
+            stats.boundaryRightColumnPiggybackCount += region.rows;
+            stats.boundaryRightColumnPiggybackBytes +=
+                static_cast<uint64_t>(region.rows) *
+                (region.cols - region.interiorCols) * ctx.elemBytes;
+        }
+        stats.streamingBodyWritebackBulkRequestCount++;
+        DPRINTF(MatrixFlowTiming,
+                "streamingBodyWritebackRowBand: row=%u rows=%u cols=%u interiorCols=%u bulk=1 extraBoundaryBytes=%llu tick=%llu\n",
+                region.rowStart, region.rows, region.cols,
+                region.interiorCols,
+                static_cast<unsigned long long>(
+                    static_cast<uint64_t>(region.rows) *
+                    (region.cols - region.interiorCols) * ctx.elemBytes),
+                static_cast<unsigned long long>(curTick()));
+    } else if (irregularBoundaryWritebackCoalescingMode() &&
+        staticOutputTileClassifierValid &&
+        region.colStart + region.cols == staticOutputMainCols &&
+        staticOutputMainCols < outputHoldCols) {
+        region.cols += outputHoldCols - staticOutputMainCols;
+        region.includesRightBoundary = true;
+        coalescedRightBoundaryCovered =
+            coalescedRightBoundaryCovered ||
+            (region.rowStart + region.rows >= staticOutputMainRows);
+        stats.boundaryRightColumnPiggybackCount += region.rows;
+        stats.boundaryRightColumnPiggybackBytes +=
+            static_cast<uint64_t>(region.rows) *
+            (region.cols - region.interiorCols) * ctx.elemBytes;
+        DPRINTF(MatrixFlowTiming,
+                "boundaryRightColumnPiggyback: row=%u rows=%u col=%u interiorCols=%u totalCols=%u extraBytes=%llu tick=%llu\n",
+                region.rowStart, region.rows, region.colStart,
+                region.interiorCols, region.cols,
+                static_cast<unsigned long long>(
+                    static_cast<uint64_t>(region.rows) *
+                    (region.cols - region.interiorCols) * ctx.elemBytes),
+                static_cast<unsigned long long>(curTick()));
+    }
+    region.boundary = false;
+    earlyBodyWritebackQueue.push_back(region);
+    if (irregularStaticOutputTileClassifierBoundaryHoldMode()) {
+        stats.interiorTileDirectWritebackCount++;
+        DPRINTF(MatrixFlowTiming,
+                "interiorTileDirectWriteback: row=%u col=%u rows=%u cols=%u tick=%llu\n",
+                region.rowStart, region.colStart, region.rows, region.cols,
+                static_cast<unsigned long long>(curTick()));
+    }
+    DPRINTF(MatrixFlowTiming,
+            "bodyInteriorWritebackBegin: queued=1 row=%u col=%u rows=%u cols=%u tick=%llu\n",
+            region.rowStart, region.colStart, region.rows, region.cols,
+            static_cast<unsigned long long>(curTick()));
+    tryStartNextEarlyBodyInteriorWriteback();
+}
+
+void
+MatrixFlowEngine::tryStartNextEarlyBodyInteriorWriteback()
+{
+    if (earlyBodyWritebackActive || earlyBodyWritebackQueue.empty()) {
+        return;
+    }
+    earlyBodyWritebackActiveRegion = earlyBodyWritebackQueue.front();
+    earlyBodyWritebackQueue.pop_front();
+    earlyBodyWritebackActiveRegion.beginTick = curTick();
+    earlyBodyWritebackActive = true;
+    stats.earlyBodyWritebackCount++;
+    if (bodyInteriorWritebackBeginTick == 0) {
+        bodyInteriorWritebackBeginTick = curTick();
+    }
+    DPRINTF(MatrixFlowTiming,
+            "bodyInteriorWritebackBegin: row=%u col=%u rows=%u cols=%u windowRows=%u stripeRowsCfg=%u maxOutstandingStripesCfg=%u tick=%llu\n",
+            earlyBodyWritebackActiveRegion.rowStart,
+            earlyBodyWritebackActiveRegion.colStart,
+            earlyBodyWritebackActiveRegion.rows,
+            earlyBodyWritebackActiveRegion.cols,
+            earlyBodyWritebackRowWindow(earlyBodyWritebackActiveRegion),
+            bodyInteriorWritebackStripeRowsConfig,
+            bodyInteriorWritebackMaxOutstandingStripesConfig,
+            static_cast<unsigned long long>(curTick()));
+    trySendMoreEarlyBodyInteriorWritebackRows();
+}
+
+void
+MatrixFlowEngine::trySendMoreEarlyBodyInteriorWritebackRows()
+{
+    if (!earlyBodyWritebackActive) {
+        return;
+    }
+    auto &region = earlyBodyWritebackActiveRegion;
+    if (region.bulkContiguous && region.nextRow == 0) {
+        const uint32_t eventIdx = 0;
+        panic_if(eventIdx >= earlyBodyWritebackRowEvents.size(),
+                 "%s: early body bulk write event index out of range\n",
+                 name());
+        const Addr totalBytes =
+            static_cast<Addr>(region.rows) * region.cols * ctx.elemBytes;
+        const Addr rowAddr = outputHoldBaseC +
+            (static_cast<Addr>(region.rowStart) * outputHoldLdc +
+             region.colStart) * ctx.elemBytes;
+        auto *src = outputHoldBuffer.data() +
+            ((static_cast<size_t>(region.rowStart) * outputHoldCols) +
+             region.colStart) * ctx.elemBytes;
+        region.issueTick = curTick();
+        if (bodyInteriorWritebackIssuedTick == 0) {
+            bodyInteriorWritebackIssuedTick = curTick();
+        }
+        const Addr interiorBytes =
+            static_cast<Addr>(region.rows) * region.interiorCols *
+            ctx.elemBytes;
+        const Addr boundaryBytes =
+            totalBytes >= interiorBytes ? totalBytes - interiorBytes : 0;
+        stats.totalDmaBytesWritten += totalBytes;
+        stats.outputHoldBytesWrittenBack += totalBytes;
+        stats.bodyInteriorWritebackBytes += interiorBytes;
+        stats.streamingBodyWritebackBytes += totalBytes;
+        if (boundaryBytes != 0) {
+            stats.boundaryWritebackBytes += boundaryBytes;
+        }
+        DPRINTF(MatrixFlowTiming,
+                "streamingBodyWritebackBulkIssued: row=%u col=%u rows=%u cols=%u bytes=%llu interiorBytes=%llu boundaryBytes=%llu tick=%llu\n",
+                region.rowStart, region.colStart, region.rows, region.cols,
+                static_cast<unsigned long long>(totalBytes),
+                static_cast<unsigned long long>(interiorBytes),
+                static_cast<unsigned long long>(boundaryBytes),
+                static_cast<unsigned long long>(curTick()));
+        dmaPort.dmaAction(MemCmd::WriteReq, rowAddr, totalBytes,
+                          &earlyBodyWritebackRowEvents[eventIdx], src, 0);
+        region.nextRow = region.rows;
+        return;
+    }
+    const uint32_t rowWindow = earlyBodyWritebackRowWindow(region);
+    while (region.nextRow < region.rows &&
+           (region.nextRow - region.completedRows) < rowWindow) {
+        const uint32_t localRow = region.nextRow;
+        panic_if(localRow >= earlyBodyWritebackRowEvents.size(),
+                 "%s: early body write row event index %u out of range\n",
+                 name(), localRow);
+        const Addr rowBytes = static_cast<Addr>(region.cols) * ctx.elemBytes;
+        const uint32_t dstRow = region.rowStart + localRow;
+        const Addr rowAddr = outputHoldBaseC +
+            (static_cast<Addr>(dstRow) * outputHoldLdc + region.colStart) *
+                ctx.elemBytes;
+        auto *src = outputHoldBuffer.data() +
+            ((static_cast<size_t>(dstRow) * outputHoldCols) +
+             region.colStart) * ctx.elemBytes;
+        if (region.issueTick == 0) {
+            region.issueTick = curTick();
+            if (bodyInteriorWritebackIssuedTick == 0) {
+                bodyInteriorWritebackIssuedTick = curTick();
+            }
+        }
+        stats.totalDmaBytesWritten += rowBytes;
+        stats.outputHoldBytesWrittenBack += rowBytes;
+        const Addr interiorBytes =
+            static_cast<Addr>(region.interiorCols) * ctx.elemBytes;
+        const Addr boundaryBytes =
+            rowBytes >= interiorBytes ? rowBytes - interiorBytes : 0;
+        stats.bodyInteriorWritebackBytes += interiorBytes;
+        if (boundaryBytes != 0) {
+            stats.boundaryWritebackBytes += boundaryBytes;
+        }
+        DPRINTF(MatrixFlowTiming,
+                "bodyInteriorWritebackIssued: row=%u col=%u bytes=%llu interiorBytes=%llu boundaryBytes=%llu boundary=%d tick=%llu\n",
+                dstRow, region.colStart,
+                static_cast<unsigned long long>(rowBytes),
+                static_cast<unsigned long long>(interiorBytes),
+                static_cast<unsigned long long>(boundaryBytes),
+                region.boundary,
+                static_cast<unsigned long long>(curTick()));
+        dmaPort.dmaAction(MemCmd::WriteReq, rowAddr, rowBytes,
+                          &earlyBodyWritebackRowEvents[localRow], src, 0);
+        region.nextRow++;
+    }
+}
+
+void
+MatrixFlowEngine::onEarlyBodyInteriorWritebackRowComplete(uint32_t rowIdx)
+{
+    if (!earlyBodyWritebackActive) {
+        return;
+    }
+    auto &region = earlyBodyWritebackActiveRegion;
+    panic_if(rowIdx >= region.rows,
+             "%s: early body write completion rowIdx=%u rows=%u\n",
+             name(), rowIdx, region.rows);
+    if (region.bulkContiguous) {
+        region.completedRows = region.rows;
+    } else {
+        region.completedRows++;
+    }
+    if (region.completedRows == region.rows) {
+        bodyInteriorWritebackDrainedTick = curTick();
+        if (region.issueTick != 0 && curTick() >= region.issueTick) {
+            stats.bodyInteriorWritebackDrainCycles +=
+                (curTick() - region.issueTick) / clockPeriod();
+        }
+        if (deviceCompletionFlagWriteBeginTick == 0) {
+            stats.bodyInteriorResponsesDrainedBeforeFinalCompletionCount++;
+        }
+        DPRINTF(MatrixFlowTiming,
+                "bodyInteriorWritebackAllResponsesDrained: row=%u col=%u rows=%u cols=%u tick=%llu\n",
+                region.rowStart, region.colStart, region.rows, region.cols,
+                static_cast<unsigned long long>(curTick()));
+        earlyBodyWritebackActive = false;
+        earlyBodyWritebackActiveRegion = OutputWriteRegion();
+        tryStartNextEarlyBodyInteriorWriteback();
+        if (boundaryOnlyFinalWritebackRequested &&
+            boundaryOutputWritebackDrainedTick != 0 &&
+            !earlyBodyWritebackActive && earlyBodyWritebackQueue.empty() &&
+            deviceCompletionFlagWriteBeginTick == 0) {
+            finalWritebackAllResponsesDrainedTick = curTick();
+            completionEligibilitySatisfiedTick = curTick();
+            DPRINTF(MatrixFlowTiming,
+                    "finalWritebackAllResponsesDrained: tick=%llu autopsyActive=%d flags=%#x source=early_body_join\n",
+                    static_cast<unsigned long long>(
+                        finalWritebackAllResponsesDrainedTick),
+                    finalCompletionChainAutopsyActive, ctx.flags);
+            DPRINTF(MatrixFlowTiming,
+                    "completionEligibilitySatisfied: tick=%llu autopsyActive=%d flags=%#x source=early_body_join\n",
+                    static_cast<unsigned long long>(
+                        completionEligibilitySatisfiedTick),
+                    finalCompletionChainAutopsyActive, ctx.flags);
+            issueWriteFlag();
+        } else if (boundaryOnlyFinalWritebackRequested &&
+                   boundaryOutputWritebackDrainedTick == 0) {
+            tryStartBoundaryOutputWriteback();
+        }
+        return;
+    }
+    trySendMoreEarlyBodyInteriorWritebackRows();
+}
+
+void
+MatrixFlowEngine::issueBoundaryOnlyFinalWriteback()
+{
+    markBatchStepFirstWorkIssued();
+    phase = Phase::WriteC;
+    boundaryOnlyFinalWritebackRequested = true;
+    boundaryWritebackRequests.clear();
+    boundaryWritebackNextReq = 0;
+    boundaryWritebackCompletedReqs = 0;
+    stats.outputHoldFinalWritebackCount++;
+    stats.outputHoldReadForEpilogueCount++;
+    stats.singleWritebackCount++;
+    stats.boundaryOnlyHoldCount++;
+    if (finalWritebackBeginTick == 0) {
+        finalWritebackBeginTick = curTick();
+    }
+    DPRINTF(MatrixFlowTiming,
+            "boundaryOutputHoldBegin: rows=%u cols=%u tick=%llu earlyActive=%d earlyQueued=%llu\n",
+            outputHoldRows, outputHoldCols,
+            static_cast<unsigned long long>(curTick()),
+            earlyBodyWritebackActive,
+            static_cast<unsigned long long>(earlyBodyWritebackQueue.size()));
+    if (irregularStaticOutputTileClassifierBoundaryHoldMode() &&
+        staticOutputTileClassifierValid &&
+        !staticOutputTileBoundaryStatsCounted) {
+        const uint32_t boundaryTiles =
+            staticRightBoundaryTileCount + staticBottomBoundaryTileCount +
+            staticCornerBoundaryTileCount;
+        stats.boundaryTileWritebackCount += boundaryTiles;
+        staticOutputTileBoundaryStatsCounted = true;
+        DPRINTF(MatrixFlowTiming,
+                "boundaryTileWriteback: right=%u bottom=%u corner=%u total=%u source=static tick=%llu\n",
+                staticRightBoundaryTileCount, staticBottomBoundaryTileCount,
+                staticCornerBoundaryTileCount, boundaryTiles,
+                static_cast<unsigned long long>(curTick()));
+    }
+
+    if (outputHoldRows == 0 || outputHoldCols == 0) {
+        tryStartBoundaryOutputWriteback();
+        return;
+    }
+
+    const uint32_t tailStartRow = irregularTailStartRow();
+    const uint32_t tailStartCol = irregularTailStartCol();
+    const uint32_t tailRows = irregularTailRows();
+    const uint32_t tailCols = irregularTailCols();
+
+    if (!(irregularBoundaryWritebackCoalescingMode() &&
+          coalescedRightBoundaryCovered) &&
+        tailCols != 0) {
+        for (uint32_t row = 0; row < tailStartRow; ++row) {
+            OutputWriteRegion req;
+            req.rowStart = row;
+            req.colStart = tailStartCol;
+            req.rows = 1;
+            req.cols = tailCols;
+            req.interiorCols = 0;
+            req.boundary = true;
+            boundaryWritebackRequests.push_back(req);
+        }
+        DPRINTF(MatrixFlowTiming,
+                "boundaryRightWritebackPlan: rows=%u startCol=%u cols=%u bytes=%u tick=%llu\n",
+                tailStartRow, tailStartCol, tailCols,
+                tailCols * static_cast<uint32_t>(ctx.elemBytes),
+                static_cast<unsigned long long>(curTick()));
+    }
+    if (!(irregularBoundaryWritebackCoalescingMode() &&
+          coalescedBottomBoundaryCovered) &&
+        tailRows != 0) {
+        for (uint32_t row = tailStartRow; row < outputHoldRows; ++row) {
+            OutputWriteRegion bottom;
+            bottom.rowStart = row;
+            bottom.colStart = 0;
+            bottom.rows = 1;
+            bottom.cols = outputHoldCols;
+            bottom.interiorCols = 0;
+            bottom.boundary = true;
+            boundaryWritebackRequests.push_back(bottom);
+        }
+    }
+    stats.finalBoundaryWritebackRequestCount += boundaryWritebackRequests.size();
+    if (irregularBoundaryWritebackCoalescingMode()) {
+        DPRINTF(MatrixFlowTiming,
+                "boundaryWritebackCoalescedFinalPlan: rightCovered=%d bottomCovered=%d finalRequests=%llu tick=%llu\n",
+                coalescedRightBoundaryCovered, coalescedBottomBoundaryCovered,
+                static_cast<unsigned long long>(boundaryWritebackRequests.size()),
+                static_cast<unsigned long long>(curTick()));
+    }
+
+    tryStartBoundaryOutputWriteback();
+}
+
+void
+MatrixFlowEngine::tryStartBoundaryOutputWriteback()
+{
+    if (!boundaryOnlyFinalWritebackRequested ||
+        boundaryOnlyFinalWritebackActive) {
+        return;
+    }
+    boundaryOnlyFinalWritebackActive = true;
+    boundaryOutputWritebackBeginTick = curTick();
+    DPRINTF(MatrixFlowTiming,
+            "boundaryOutputWritebackBegin: requests=%llu tick=%llu\n",
+            static_cast<unsigned long long>(boundaryWritebackRequests.size()),
+            static_cast<unsigned long long>(boundaryOutputWritebackBeginTick));
+    if (boundaryWritebackRequests.empty()) {
+        boundaryOnlyFinalWritebackActive = false;
+        boundaryOutputWritebackDrainedTick = curTick();
+        if (boundaryOutputWritebackIssuedTick == 0) {
+            boundaryOutputWritebackIssuedTick = curTick();
+            finalWritebackIssuedTick = curTick();
+        }
+        DPRINTF(MatrixFlowTiming,
+                "boundaryOutputAllResponsesDrained: requests=0 tick=%llu\n",
+                static_cast<unsigned long long>(curTick()));
+        if (earlyBodyWritebackActive || !earlyBodyWritebackQueue.empty()) {
+            return;
+        }
+        finalWritebackAllResponsesDrainedTick = curTick();
+        completionEligibilitySatisfiedTick = curTick();
+        issueWriteFlag();
+        return;
+    }
+    trySendMoreBoundaryOutputWrites();
+}
+
+void
+MatrixFlowEngine::trySendMoreBoundaryOutputWrites()
+{
+    if (!boundaryOnlyFinalWritebackActive) {
+        return;
+    }
+    while (boundaryWritebackNextReq < boundaryWritebackRequests.size() &&
+           (boundaryWritebackNextReq - boundaryWritebackCompletedReqs) <
+               kMaxInFlight) {
+        const uint32_t idx = boundaryWritebackNextReq;
+        panic_if(idx >= boundaryOutputWriteEvents.size(),
+                 "%s: boundary write event index %u out of range\n",
+                 name(), idx);
+        auto &req = boundaryWritebackRequests[idx];
+        const Addr rowBytes = static_cast<Addr>(req.cols) * ctx.elemBytes;
+        const Addr rowAddr = outputHoldBaseC +
+            (static_cast<Addr>(req.rowStart) * outputHoldLdc + req.colStart) *
+                ctx.elemBytes;
+        auto *src = outputHoldBuffer.data() +
+            ((static_cast<size_t>(req.rowStart) * outputHoldCols) +
+             req.colStart) * ctx.elemBytes;
+        if (boundaryOutputWritebackIssuedTick == 0) {
+            boundaryOutputWritebackIssuedTick = curTick();
+            finalWritebackIssuedTick = curTick();
+        }
+        stats.totalDmaBytesWritten += rowBytes;
+        stats.outputHoldBytesWrittenBack += rowBytes;
+        stats.boundaryWritebackBytes += rowBytes;
+        DPRINTF(MatrixFlowTiming,
+                "boundaryOutputWritebackIssued: index=%u row=%u col=%u bytes=%llu tick=%llu\n",
+                idx, req.rowStart, req.colStart,
+                static_cast<unsigned long long>(rowBytes),
+                static_cast<unsigned long long>(curTick()));
+        dmaPort.dmaAction(MemCmd::WriteReq, rowAddr, rowBytes,
+                          &boundaryOutputWriteEvents[idx], src, 0);
+        boundaryWritebackNextReq++;
+    }
+}
+
+void
+MatrixFlowEngine::onBoundaryOutputWriteComplete(uint32_t eventIdx)
+{
+    if (!boundaryOnlyFinalWritebackActive) {
+        return;
+    }
+    panic_if(eventIdx >= boundaryWritebackRequests.size(),
+             "%s: boundary completion idx=%u requests=%zu\n",
+             name(), eventIdx, boundaryWritebackRequests.size());
+    boundaryWritebackCompletedReqs++;
+    if (boundaryWritebackCompletedReqs == boundaryWritebackRequests.size()) {
+        boundaryOnlyFinalWritebackActive = false;
+        boundaryOutputWritebackDrainedTick = curTick();
+        if (boundaryOutputWritebackIssuedTick != 0 &&
+            curTick() >= boundaryOutputWritebackIssuedTick) {
+            stats.boundaryWritebackDrainCycles +=
+                (curTick() - boundaryOutputWritebackIssuedTick) /
+                    clockPeriod();
+        }
+        stats.boundaryOutstandingWriteRespAtCompletionGate +=
+            boundaryWritebackRequests.size() - boundaryWritebackCompletedReqs;
+        DPRINTF(MatrixFlowTiming,
+                "boundaryOutputAllResponsesDrained: requests=%llu tick=%llu\n",
+                static_cast<unsigned long long>(
+                    boundaryWritebackRequests.size()),
+                static_cast<unsigned long long>(curTick()));
+        if (!earlyBodyWritebackActive && earlyBodyWritebackQueue.empty()) {
+            finalWritebackAllResponsesDrainedTick = curTick();
+            completionEligibilitySatisfiedTick = curTick();
+            DPRINTF(MatrixFlowTiming,
+                    "finalWritebackAllResponsesDrained: tick=%llu autopsyActive=%d flags=%#x source=boundary\n",
+                    static_cast<unsigned long long>(
+                        finalWritebackAllResponsesDrainedTick),
+                    finalCompletionChainAutopsyActive, ctx.flags);
+            DPRINTF(MatrixFlowTiming,
+                    "completionEligibilitySatisfied: tick=%llu autopsyActive=%d flags=%#x source=boundary\n",
+                    static_cast<unsigned long long>(
+                        completionEligibilitySatisfiedTick),
+                    finalCompletionChainAutopsyActive, ctx.flags);
+            issueWriteFlag();
+        }
+        return;
+    }
+    trySendMoreBoundaryOutputWrites();
+}
+
+void
+MatrixFlowEngine::issueWriteHeldOutputBatch()
+{
+    markBatchStepFirstWorkIssued();
+    phase = Phase::WriteC;
+    if (finalWritebackBeginTick == 0) {
+        finalWritebackBeginTick = curTick();
+    }
+    DPRINTF(MatrixFlowTiming,
+            "finalWritebackBegin: tick=%llu autopsyActive=%d flags=%#x\n",
+            static_cast<unsigned long long>(finalWritebackBeginTick),
+            finalCompletionChainAutopsyActive, ctx.flags);
+    outputHoldFinalWritebackInProgress = true;
+    reqsIssuedC = 0;
+    reqsCompletedC = 0;
+    targetReqsC = 1;
+    outputHoldWritebackNextRow = 0;
+    outputHoldWritebackCompletedRows = 0;
+    stats.outputHoldFinalWritebackCount++;
+    stats.singleWritebackCount++;
+    stats.outputHoldReadForEpilogueCount++;
+    trySendMoreHeldOutput();
+}
+
+void
+MatrixFlowEngine::trySendMoreHeldOutput()
+{
+    if (heldOutputWriteCompleteEvent.scheduled() ||
+        outputHoldWritebackNextRow >= targetReqsC) {
+        return;
+    }
+
+    const Addr totalBytes =
+        static_cast<Addr>(outputHoldRows) * outputHoldCols * ctx.elemBytes;
+    if (totalBytes == 0) {
+        ++outputHoldWritebackNextRow;
+        ++reqsIssuedC;
+        schedule(heldOutputWriteCompleteEvent, curTick());
+        return;
+    }
+
+    auto *src = outputHoldBuffer.data();
+    stats.totalDmaBytesWritten += totalBytes;
+    stats.outputHoldBytesWrittenBack += totalBytes;
+    if (finalWritebackIssuedTick == 0) {
+        finalWritebackIssuedTick = curTick();
+    }
+    DPRINTF(MatrixFlowTiming,
+            "finalWritebackIssued: tick=%llu bytes=%llu autopsyActive=%d flags=%#x\n",
+            static_cast<unsigned long long>(finalWritebackIssuedTick),
+            static_cast<unsigned long long>(totalBytes),
+            finalCompletionChainAutopsyActive, ctx.flags);
+    dmaPort.dmaAction(MemCmd::WriteReq, outputHoldBaseC, totalBytes,
+                      &heldOutputWriteCompleteEvent, src, 0);
+    ++outputHoldWritebackNextRow;
+    ++reqsIssuedC;
+}
+
+void
+MatrixFlowEngine::onHeldOutputWriteComplete()
+{
+    ++outputHoldWritebackCompletedRows;
+    ++reqsCompletedC;
+    if (outputHoldWritebackCompletedRows == targetReqsC) {
+        outputHoldFinalWritebackInProgress = false;
+        finalWritebackAllResponsesDrainedTick = curTick();
+        completionEligibilitySatisfiedTick = curTick();
+        DPRINTF(MatrixFlowTiming,
+                "finalWritebackAllResponsesDrained: tick=%llu autopsyActive=%d flags=%#x\n",
+                static_cast<unsigned long long>(
+                    finalWritebackAllResponsesDrainedTick),
+                finalCompletionChainAutopsyActive, ctx.flags);
+        DPRINTF(MatrixFlowTiming,
+                "lastOutstandingDmaCountZero: tick=%llu count=0\n",
+                static_cast<unsigned long long>(
+                    finalWritebackAllResponsesDrainedTick));
+        DPRINTF(MatrixFlowTiming,
+                "lastOutstandingWriteRespZero: tick=%llu count=0\n",
+                static_cast<unsigned long long>(
+                    finalWritebackAllResponsesDrainedTick));
+        DPRINTF(MatrixFlowTiming,
+                "completionEligibilitySatisfied: tick=%llu autopsyActive=%d flags=%#x\n",
+                static_cast<unsigned long long>(
+                    completionEligibilitySatisfiedTick),
+                finalCompletionChainAutopsyActive, ctx.flags);
+        issueWriteFlag();
+        return;
+    }
+    trySendMoreHeldOutput();
+}
+
 bool
 MatrixFlowEngine::hasNextKTile() const
 {
-    return ctx.k + ctx.curTileK < ctx.size;
+    return ctx.k + ctx.curTileK < ctx.kTotal;
 }
 
 bool
 MatrixFlowEngine::hasNextOutputTile() const
 {
-    return ctx.j + ctx.curTileN < ctx.size || ctx.i + ctx.curTileM < ctx.size;
+    return ctx.j + ctx.curTileN < ctx.nTotal ||
+           ctx.i + ctx.curTileM < ctx.mTotal;
 }
 
 bool
@@ -1898,9 +4369,7 @@ MatrixFlowEngine::clearCoverageGatherForCurrentTile()
                     ? isSmartCoverageTargetForContext(gctx, row)
                     : isCoverageBlindspotTargetPattern(
                           row, BProtectionClass::None,
-                          gctx.baseB +
-                              ((static_cast<Addr>(gctx.k + row) * gctx.size +
-                                gctx.j) * gctx.elemBytes));
+                          matrixBAddr(gctx, gctx.k + row, gctx.j));
             if (target) {
                 ++dropped;
             }
@@ -1945,9 +4414,7 @@ MatrixFlowEngine::ageUpCoverageGatherCandidates()
                 ? isSmartCoverageTargetForContext(gctx, row)
                 : isCoverageBlindspotTargetPattern(
                       row, BProtectionClass::None,
-                      gctx.baseB +
-                          ((static_cast<Addr>(gctx.k + row) * gctx.size +
-                            gctx.j) * gctx.elemBytes));
+                      matrixBAddr(gctx, gctx.k + row, gctx.j));
         if (!target) {
             continue;
         }
@@ -1963,24 +4430,24 @@ MatrixFlowEngine::ageUpCoverageGatherCandidates()
 uint32_t
 MatrixFlowEngine::futureITileReuseCount(const GemmContext &gctx) const
 {
-    if (gctx.i + gctx.curTileM >= gctx.size || gctx.tileM == 0) {
+    if (gctx.i + gctx.curTileM >= gctx.mTotal || gctx.tileM == 0) {
         return 0;
     }
 
     const uint32_t remaining_rows =
-        gctx.size - std::min(gctx.size, gctx.i + gctx.curTileM);
+        gctx.mTotal - std::min(gctx.mTotal, gctx.i + gctx.curTileM);
     return (remaining_rows + gctx.tileM - 1) / gctx.tileM;
 }
 
 uint32_t
 MatrixFlowEngine::futureJTileReuseCount(const GemmContext &gctx) const
 {
-    if (gctx.j + gctx.curTileN >= gctx.size || gctx.tileN == 0) {
+    if (gctx.j + gctx.curTileN >= gctx.nTotal || gctx.tileN == 0) {
         return 0;
     }
 
     const uint32_t remaining_cols =
-        gctx.size - std::min(gctx.size, gctx.j + gctx.curTileN);
+        gctx.nTotal - std::min(gctx.nTotal, gctx.j + gctx.curTileN);
     return (remaining_cols + gctx.tileN - 1) / gctx.tileN;
 }
 
@@ -1993,9 +4460,9 @@ MatrixFlowEngine::tileStepsToNextUse(const GemmContext &gctx) const
     }
 
     const uint32_t total_j_tiles =
-        (gctx.size + gctx.tileN - 1) / gctx.tileN;
+        (gctx.nTotal + gctx.tileN - 1) / gctx.tileN;
     const uint32_t total_k_tiles =
-        (gctx.size + gctx.tileK - 1) / gctx.tileK;
+        (gctx.kTotal + gctx.tileK - 1) / gctx.tileK;
     if (total_j_tiles == 0 || total_k_tiles == 0) {
         return std::numeric_limits<uint32_t>::max();
     }
@@ -2037,9 +4504,7 @@ MatrixFlowEngine::isSmartACandidateForContext(const GemmContext &gctx,
     if (rowIdx >= gctx.curTileM) {
         return false;
     }
-    const Addr rowAddr = gctx.baseA +
-        ((static_cast<Addr>(gctx.i + rowIdx) * gctx.size + gctx.k) *
-         gctx.elemBytes);
+    const Addr rowAddr = matrixAAddr(gctx, gctx.i + rowIdx, gctx.k);
     const bool repeat =
         oracleARecurrenceBucket(rowAddr) == OracleARecurrenceBucket::Repeat;
     const uint32_t futureReuse = futureJTileReuseCount(gctx);
@@ -2062,9 +4527,7 @@ MatrixFlowEngine::selectSmartCurrentARow() const
         if (currentARowIssued[row]) {
             continue;
         }
-        const Addr rowAddr = ctx.baseA +
-            ((static_cast<Addr>(ctx.i + row) * ctx.size + ctx.k) *
-             ctx.elemBytes);
+        const Addr rowAddr = matrixAAddr(ctx, ctx.i + row, ctx.k);
         int score = 0;
         if (oracleARecurrenceBucket(rowAddr) == OracleARecurrenceBucket::Repeat) {
             score += 8;
@@ -2100,9 +4563,8 @@ MatrixFlowEngine::selectSmartNextPrefetchARow() const
         if (nextPrefetchARowIssued[row]) {
             continue;
         }
-        const Addr rowAddr = nextCtx.baseA +
-            ((static_cast<Addr>(nextCtx.i + row) * nextCtx.size + nextCtx.k) *
-             nextCtx.elemBytes);
+        const Addr rowAddr = matrixAAddr(nextCtx, nextCtx.i + row,
+                                         nextCtx.k);
         int score = 0;
         if (oracleARecurrenceBucket(rowAddr) == OracleARecurrenceBucket::Repeat) {
             score += 8;
@@ -3048,24 +5510,24 @@ MatrixFlowEngine::recordOracleSelectedRowMiss(uint32_t rowIdx)
 uint32_t
 MatrixFlowEngine::rescueFutureITileReuseCount() const
 {
-    if (ctx.i + ctx.curTileM >= ctx.size || ctx.tileM == 0) {
+    if (ctx.i + ctx.curTileM >= ctx.mTotal || ctx.tileM == 0) {
         return 0;
     }
 
     const uint32_t remaining_rows =
-        ctx.size - std::min(ctx.size, ctx.i + ctx.curTileM);
+        ctx.mTotal - std::min(ctx.mTotal, ctx.i + ctx.curTileM);
     return (remaining_rows + ctx.tileM - 1) / ctx.tileM;
 }
 
 uint32_t
 MatrixFlowEngine::rescueFutureJTileReuseCount() const
 {
-    if (ctx.j + ctx.curTileN >= ctx.size || ctx.tileN == 0) {
+    if (ctx.j + ctx.curTileN >= ctx.nTotal || ctx.tileN == 0) {
         return 0;
     }
 
     const uint32_t remaining_cols =
-        ctx.size - std::min(ctx.size, ctx.j + ctx.curTileN);
+        ctx.nTotal - std::min(ctx.nTotal, ctx.j + ctx.curTileN);
     return (remaining_cols + ctx.tileN - 1) / ctx.tileN;
 }
 
@@ -3078,9 +5540,9 @@ MatrixFlowEngine::rescueTileStepsToNextUse() const
     }
 
     const uint32_t total_j_tiles =
-        (ctx.size + ctx.tileN - 1) / ctx.tileN;
+        (ctx.nTotal + ctx.tileN - 1) / ctx.tileN;
     const uint32_t total_k_tiles =
-        (ctx.size + ctx.tileK - 1) / ctx.tileK;
+        (ctx.kTotal + ctx.tileK - 1) / ctx.tileK;
     if (total_j_tiles == 0 || total_k_tiles == 0) {
         return std::numeric_limits<uint32_t>::max();
     }
@@ -3228,9 +5690,7 @@ MatrixFlowEngine::shouldAdmitVipRescueRow(uint32_t rowIdx) const
     }
 
     if (vipRescueAntiDeadBlockMode()) {
-        const Addr rowAddr = ctx.baseB +
-            ((static_cast<Addr>(ctx.k + rowIdx) * ctx.size + ctx.j) *
-             ctx.elemBytes);
+        const Addr rowAddr = matrixBAddr(ctx, ctx.k + rowIdx, ctx.j);
         return classifyVipRescueAdmission(rowIdx, rowAddr) !=
                VipAdmitClass::Reject;
     }
@@ -4089,9 +6549,7 @@ MatrixFlowEngine::tryServeCurrentARowFromVip(uint32_t rowIdx, bool countMiss)
 
     const Addr rowBytes =
         static_cast<Addr>(ctx.curTileK) * ctx.elemBytes;
-    const Addr rowAddr = ctx.baseA +
-        ((static_cast<Addr>(ctx.i + rowIdx) * ctx.size + ctx.k) *
-         ctx.elemBytes);
+    const Addr rowAddr = matrixAAddr(ctx, ctx.i + rowIdx, ctx.k);
     const int slotIdx = findVipSlot(rowAddr, rowBytes);
     if (slotIdx < 0) {
         if (countMiss) {
@@ -4153,9 +6611,7 @@ MatrixFlowEngine::tryServeCurrentBRowFromMHot(uint32_t rowIdx,
 
     const Addr rowBytes =
         static_cast<Addr>(ctx.curTileN) * ctx.elemBytes;
-    const Addr rowAddr = ctx.baseB +
-        ((static_cast<Addr>(ctx.k + rowIdx) * ctx.size + ctx.j) *
-         ctx.elemBytes);
+    const Addr rowAddr = matrixBAddr(ctx, ctx.k + rowIdx, ctx.j);
     const int slotIdx = findMHotSlot(rowAddr, rowBytes);
     if (slotIdx < 0) {
         return false;
@@ -4224,9 +6680,7 @@ MatrixFlowEngine::tryPrimeCurrentBRowFromCoverageShadow(uint32_t rowIdx,
 
     const Addr rowBytes =
         static_cast<Addr>(ctx.curTileN) * ctx.elemBytes;
-    const Addr rowAddr = ctx.baseB +
-        ((static_cast<Addr>(ctx.k + rowIdx) * ctx.size + ctx.j) *
-         ctx.elemBytes);
+    const Addr rowAddr = matrixBAddr(ctx, ctx.k + rowIdx, ctx.j);
     const int slotIdx = findCoverageShadowSlot(rowAddr, rowBytes);
     if (slotIdx < 0) {
         return false;
@@ -4280,9 +6734,7 @@ MatrixFlowEngine::primeCurrentBRowsFromCoverageShadow()
         if (currentBRowState[row] != BRowState::Empty) {
             continue;
         }
-        const Addr rowAddr = ctx.baseB +
-            ((static_cast<Addr>(ctx.k + row) * ctx.size + ctx.j) *
-             ctx.elemBytes);
+        const Addr rowAddr = matrixBAddr(ctx, ctx.k + row, ctx.j);
         if (!isCoverageBlindspotTargetPattern(row, BProtectionClass::None,
                                               rowAddr)) {
             continue;
@@ -4314,9 +6766,7 @@ MatrixFlowEngine::tryServeCurrentBRowFromCoverageShadow(uint32_t rowIdx,
 
     const Addr rowBytes =
         static_cast<Addr>(ctx.curTileN) * ctx.elemBytes;
-    const Addr rowAddr = ctx.baseB +
-        ((static_cast<Addr>(ctx.k + rowIdx) * ctx.size + ctx.j) *
-         ctx.elemBytes);
+    const Addr rowAddr = matrixBAddr(ctx, ctx.k + rowIdx, ctx.j);
     const int slotIdx = findCoverageShadowSlot(rowAddr, rowBytes);
     if (slotIdx < 0) {
         return false;
@@ -4357,9 +6807,9 @@ MatrixFlowEngine::tryServeNextOutputRowFromMHot(uint32_t rowIdx,
 
     const Addr rowBytes =
         static_cast<Addr>(nextOutputCtx.curTileN) * nextOutputCtx.elemBytes;
-    const Addr rowAddr = nextOutputCtx.baseB +
-        ((static_cast<Addr>(nextOutputCtx.k + rowIdx) * nextOutputCtx.size +
-          nextOutputCtx.j) * nextOutputCtx.elemBytes);
+    const Addr rowAddr = matrixBAddr(nextOutputCtx,
+                                     nextOutputCtx.k + rowIdx,
+                                     nextOutputCtx.j);
     const int slotIdx = findMHotSlot(rowAddr, rowBytes);
     if (slotIdx < 0) {
         return false;
@@ -4407,9 +6857,7 @@ MatrixFlowEngine::tryServeCurrentBRowFromVip(uint32_t rowIdx, bool countMiss)
 
     const Addr rowBytes =
         static_cast<Addr>(ctx.curTileN) * ctx.elemBytes;
-    const Addr rowAddr = ctx.baseB +
-        ((static_cast<Addr>(ctx.k + rowIdx) * ctx.size + ctx.j) *
-         ctx.elemBytes);
+    const Addr rowAddr = matrixBAddr(ctx, ctx.k + rowIdx, ctx.j);
     const int slotIdx = findVipSlot(rowAddr, rowBytes);
     if (slotIdx < 0) {
         if (countMiss || currentBVipBacked[rowIdx]) {
@@ -4858,9 +7306,8 @@ MatrixFlowEngine::nextOutputPendingRowCanUseMHot() const
 
     const Addr rowBytes =
         static_cast<Addr>(nextOutputCtx.curTileN) * nextOutputCtx.elemBytes;
-    const Addr rowAddr = nextOutputCtx.baseB +
-        ((static_cast<Addr>(nextOutputCtx.k + row) * nextOutputCtx.size +
-          nextOutputCtx.j) * nextOutputCtx.elemBytes);
+    const Addr rowAddr =
+        matrixBAddr(nextOutputCtx, nextOutputCtx.k + row, nextOutputCtx.j);
     return findMHotSlot(rowAddr, rowBytes) >= 0;
 }
 
@@ -5353,9 +7800,7 @@ MatrixFlowEngine::issueCurrentBRow(uint32_t rowIdx, BProtectionClass cls)
     if (mhotRuntimeFirstCutMode() || mhotGapAwareNextCutMode() ||
         coverageShadowMode() ||
         mhotCoverageBlindspotCandidateMode()) {
-        const Addr rowAddr = ctx.baseB +
-            ((static_cast<Addr>(ctx.k + rowIdx) * ctx.size + ctx.j) *
-             ctx.elemBytes);
+        const Addr rowAddr = matrixBAddr(ctx, ctx.k + rowIdx, ctx.j);
         target_blindspot =
             coverageShadowPoolEnabled() &&
             isCoverageBlindspotTargetPattern(rowIdx, cls, rowAddr);
@@ -5468,9 +7913,7 @@ MatrixFlowEngine::issueCurrentBRow(uint32_t rowIdx, BProtectionClass cls)
 
     const Addr rowBytes =
         static_cast<Addr>(ctx.curTileN) * ctx.elemBytes;
-    const Addr rowAddr = ctx.baseB +
-        ((static_cast<Addr>(ctx.k + rowIdx) * ctx.size + ctx.j) *
-         ctx.elemBytes);
+    const Addr rowAddr = matrixBAddr(ctx, ctx.k + rowIdx, ctx.j);
     auto *dst = tileBBuffer.data() + rowIdx * rowBytes;
     auto [reqAddr, reqBytes, reqOffset] = planReadRequest(rowAddr, rowBytes);
     uint8_t *dmaDst = dst;
@@ -5541,9 +7984,9 @@ MatrixFlowEngine::issueOneNextOutputProtectedB()
     if (nextOutputPrefetchBRowIssued[row]) {
         return false;
     }
-    const Addr rowAddr = nextOutputCtx.baseB +
-        ((static_cast<Addr>(nextOutputCtx.k + row) * nextOutputCtx.size +
-          nextOutputCtx.j) * nextOutputCtx.elemBytes);
+    const Addr rowAddr = matrixBAddr(nextOutputCtx,
+                                     nextOutputCtx.k + row,
+                                     nextOutputCtx.j);
     auto *dst = nextOutputTileBBuffer.data() + row * rowBytes;
     auto [reqAddr, reqBytes, reqOffset] = planReadRequest(rowAddr, rowBytes);
     uint8_t *dmaDst = dst;
@@ -5934,9 +8377,9 @@ MatrixFlowEngine::buildNextKContext() const
 {
     GemmContext next = ctx;
     next.k += ctx.curTileK;
-    next.curTileM = std::min(next.tileM, next.size - next.i);
-    next.curTileN = std::min(next.tileN, next.size - next.j);
-    next.curTileK = std::min(next.tileK, next.size - next.k);
+    next.curTileM = std::min(next.tileM, next.mTotal - next.i);
+    next.curTileN = std::min(next.tileN, next.nTotal - next.j);
+    next.curTileK = std::min(next.tileK, next.kTotal - next.k);
     return next;
 }
 
@@ -5945,16 +8388,16 @@ MatrixFlowEngine::buildNextOutputContext() const
 {
     GemmContext next = ctx;
     next.k = 0;
-    if (ctx.j + ctx.curTileN < ctx.size) {
+    if (ctx.j + ctx.curTileN < ctx.nTotal) {
         next.j = ctx.j + ctx.curTileN;
         next.i = ctx.i;
     } else {
         next.j = 0;
         next.i = ctx.i + ctx.curTileM;
     }
-    next.curTileM = std::min(next.tileM, next.size - next.i);
-    next.curTileN = std::min(next.tileN, next.size - next.j);
-    next.curTileK = std::min(next.tileK, next.size - next.k);
+    next.curTileM = std::min(next.tileM, next.mTotal - next.i);
+    next.curTileN = std::min(next.tileN, next.nTotal - next.j);
+    next.curTileK = std::min(next.tileK, next.kTotal - next.k);
     return next;
 }
 
@@ -6079,9 +8522,7 @@ MatrixFlowEngine::applyPrefetchedNextOutputRows(uint32_t prefetched_rows,
                 continue;
             }
             stageCurrentOracleVipSelectedRow(row);
-            const Addr rowAddr = ctx.baseB +
-                ((static_cast<Addr>(ctx.k + row) * ctx.size + ctx.j) *
-                 ctx.elemBytes);
+            const Addr rowAddr = matrixBAddr(ctx, ctx.k + row, ctx.j);
             if (!tryInsertVipRow(rowAddr, rowBytes,
                                  tileBBuffer.data() + row * rowBytes,
                                  VipSourceClass::NextOutput, cls, admit)) {
@@ -6264,6 +8705,10 @@ MatrixFlowEngine::maybePrefetchNextOutputTile()
         hasNextKTile()) {
         return;
     }
+    if (currentSubproblemUsesFusedEdges() &&
+        (irregularTailRows() > 1 || irregularTailCols() > 1)) {
+        return;
+    }
 
     startOutputPrefetchTile(buildNextOutputContext());
 }
@@ -6293,20 +8738,68 @@ MatrixFlowEngine::issueFetchDescriptor()
 void
 MatrixFlowEngine::onFetchDescComplete()
 {
-    panic_if(pendingDesc.size == 0,
-             "%s: descriptor fetched with invalid size=0 at %#llx\n",
+    panic_if(pendingDesc.m == 0 || pendingDesc.n == 0 || pendingDesc.k == 0,
+             "%s: descriptor fetched with invalid dims=(%u,%u,%u) at %#llx\n",
              name(), static_cast<unsigned long long>(pendingDescAddr));
+    const uint32_t autopsyIdx = std::min<uint32_t>(batchSubproblemIndex,
+        kResidualAutopsyMaxBatchSteps - 1);
+    batchStepDescFetchedTicks[autopsyIdx] = curTick();
+    if (batchTransitionBeginTicks[autopsyIdx] != 0 &&
+        curTick() >= batchTransitionBeginTicks[autopsyIdx]) {
+        const Tick delta = curTick() - batchTransitionBeginTicks[autopsyIdx];
+        batchTransitionEndTicks[autopsyIdx] = curTick();
+        stats.batchTransitionGapCycles += delta / clockPeriod();
+        stats.batchTransitionCount++;
+        if (autopsyIdx == 1) {
+            stats.bodyPostGapCycles += delta / clockPeriod();
+        } else if (autopsyIdx == 2) {
+            stats.rightEdgeNoOpGapCycles += delta / clockPeriod();
+        } else if (autopsyIdx == 3) {
+            stats.bottomEdgePreStartGapCycles += delta / clockPeriod();
+        }
+        DPRINTF(MatrixFlowTiming,
+                "batchTransitionEnd: index=%u tick=%llu cycles=%llu\n",
+                autopsyIdx, static_cast<unsigned long long>(curTick()),
+                static_cast<unsigned long long>(delta / clockPeriod()));
+    }
+    DPRINTF(MatrixFlowTiming,
+            "batchStepDescFetched: index=%u tick=%llu\n",
+            autopsyIdx, static_cast<unsigned long long>(curTick()));
 
     ctx.baseA = pendingDesc.addrA;
     ctx.baseB = pendingDesc.addrB;
     ctx.baseC = pendingDesc.addrC;
     ctx.flagAddr = pendingDesc.flagAddr;
-    ctx.size = pendingDesc.size;
+    ctx.mTotal = pendingDesc.m;
+    ctx.nTotal = pendingDesc.n;
+    ctx.kTotal = pendingDesc.k;
+    ctx.lda = pendingDesc.lda != 0 ? pendingDesc.lda : pendingDesc.k;
+    ctx.ldb = pendingDesc.ldb != 0 ? pendingDesc.ldb : pendingDesc.n;
+    ctx.ldc = pendingDesc.ldc != 0 ? pendingDesc.ldc : pendingDesc.n;
+    // Deprecated square-only alias; keep zeroed so any stale use is obvious.
+    ctx.size = 0;
+    ctx.flags = pendingDesc.flags;
+    finalCompletionChainAutopsyActive =
+        (ctx.flags & kDescFlagIrregularFinalCompletionChainAutopsy);
+    ctx.completionValue =
+        pendingDesc.completionValue != 0 ? pendingDesc.completionValue : 1;
     ctx.elemBytes = sizeof(uint32_t);
+    panic_if(ctx.lda < ctx.kTotal,
+             "%s: descriptor lda=%u < k=%u at %#llx\n",
+             name(), ctx.lda, ctx.kTotal,
+             static_cast<unsigned long long>(pendingDescAddr));
+    panic_if(ctx.ldb < ctx.nTotal,
+             "%s: descriptor ldb=%u < n=%u at %#llx\n",
+             name(), ctx.ldb, ctx.nTotal,
+             static_cast<unsigned long long>(pendingDescAddr));
+    panic_if(ctx.ldc < ctx.nTotal,
+             "%s: descriptor ldc=%u < n=%u at %#llx\n",
+             name(), ctx.ldc, ctx.nTotal,
+             static_cast<unsigned long long>(pendingDescAddr));
     const uint32_t cap = static_cast<uint32_t>(kMaxTileDim);
-    ctx.tileM = std::min(cap, ctx.size);
-    ctx.tileN = std::min(cap, ctx.size);
-    ctx.tileK = std::min(cap, ctx.size);
+    ctx.tileM = std::min(cap, ctx.mTotal);
+    ctx.tileN = std::min(cap, ctx.nTotal);
+    ctx.tileK = std::min(cap, ctx.kTotal);
     ctx.i = 0;
     ctx.j = 0;
     ctx.k = 0;
@@ -6315,36 +8808,221 @@ MatrixFlowEngine::onFetchDescComplete()
     pendingMatrixB = ctx.baseB;
     pendingResult = ctx.baseC;
     pendingFlagAddr = ctx.flagAddr;
-    pendingSize = static_cast<int>(ctx.size);
+    pendingM = ctx.mTotal;
+    pendingN = ctx.nTotal;
+    pendingK = ctx.kTotal;
+    completionFlagValue = ctx.completionValue;
+    batchStepDescDecodedTicks[autopsyIdx] = curTick();
+    if ((ctx.flags & kDescFlagPeeledSubproblem) &&
+        !batchSequenceActive &&
+        (ctx.flags & kDescFlagChainContinue)) {
+        batchSequenceActive = true;
+        batchSubproblemIndex = 0;
+        nextBatchDescAddr = pendingDescAddr + sizeof(Descriptor);
+        stats.peeledBatchLaunchCount++;
+        stats.peeledBatchSingleDoorbellCount++;
+        stats.peeledBatchGuestWaitCount++;
+    } else if ((ctx.flags & kDescFlagPeeledSubproblem) &&
+               !batchSequenceActive) {
+        stats.peeledLegacyLaunchCount++;
+        stats.peeledLegacyDoorbellCount++;
+        stats.peeledLegacyCompletionWaitCount++;
+    } else if (batchSequenceActive && (ctx.flags & kDescFlagChainContinue)) {
+        nextBatchDescAddr = pendingDescAddr + sizeof(Descriptor);
+    }
     if (hierarchicalProtectedBSchedulerMode()) {
-        warn("%s: hier-trace descriptorLoaded size=%u A=%#llx B=%#llx "
-             "C=%#llx flag=%#llx\n",
-             name(), ctx.size,
+        warn("%s: hier-trace descriptorLoaded dims=(%u,%u,%u) "
+             "lda/ldb/ldc=(%u,%u,%u) A=%#llx B=%#llx C=%#llx "
+             "flag=%#llx completion=%llu\n",
+             name(), ctx.mTotal, ctx.nTotal, ctx.kTotal,
+             ctx.lda, ctx.ldb, ctx.ldc,
              static_cast<unsigned long long>(ctx.baseA),
              static_cast<unsigned long long>(ctx.baseB),
              static_cast<unsigned long long>(ctx.baseC),
-             static_cast<unsigned long long>(ctx.flagAddr));
+             static_cast<unsigned long long>(ctx.flagAddr),
+             static_cast<unsigned long long>(ctx.completionValue));
     }
 
     DPRINTF(MatrixFlow,
-            "Descriptor loaded: A=%#llx B=%#llx C=%#llx flag=%#llx size=%u "
+            "Descriptor loaded: A=%#llx B=%#llx C=%#llx flag=%#llx "
+            "dims=(%u,%u,%u) lda/ldb/ldc=(%u,%u,%u) completion=%llu "
             "tile=(%u,%u,%u)\n",
             static_cast<unsigned long long>(ctx.baseA),
             static_cast<unsigned long long>(ctx.baseB),
             static_cast<unsigned long long>(ctx.baseC),
             static_cast<unsigned long long>(ctx.flagAddr),
-            ctx.size, ctx.tileM, ctx.tileN, ctx.tileK);
+            ctx.mTotal, ctx.nTotal, ctx.kTotal,
+            ctx.lda, ctx.ldb, ctx.ldc,
+            static_cast<unsigned long long>(ctx.completionValue),
+            ctx.tileM, ctx.tileN, ctx.tileK);
+    DPRINTF(MatrixFlowTiming,
+            "descriptorFlags: pending=%#x ctx=%#x chain=%d suppress=%d peeled=%d irregularTail=%d fusedEdges=%d fusedRightClean=%d noWaitFusedRight=%d noWaitFusedBottom=%d singleFusedIrregular=%d completionAutopsy=%d\n",
+            pendingDesc.flags, ctx.flags,
+            !!(ctx.flags & kDescFlagChainContinue),
+            !!(ctx.flags & kDescFlagSuppressCompletion),
+            !!(ctx.flags & kDescFlagPeeledSubproblem),
+            !!(ctx.flags & kDescFlagIrregularBTailScratchpadOutputHold),
+            !!(ctx.flags & kDescFlagIrregularFusedEdgesCompletionOptimized),
+            !!(ctx.flags & kDescFlagIrregularFusedRightEdgeCleanTiming),
+            !!(ctx.flags & kDescFlagIrregularNoWaitFusedRight),
+            !!(ctx.flags & kDescFlagIrregularNoWaitFusedBottom),
+            !!(ctx.flags & kDescFlagIrregularSingleFusedDescriptorCornerCollapse),
+            !!(ctx.flags & kDescFlagIrregularFinalCompletionChainAutopsy));
+    DPRINTF(MatrixFlowTiming,
+            "boundaryOnlyHoldEarlyBodyWriteback=%d staticOutputTileClassifierBoundaryHold=%d boundaryWritebackCoalescing=%d streamingBodyWriteback=%d\n",
+            !!(ctx.flags &
+               kDescFlagIrregularBoundaryOnlyHoldEarlyBodyWriteback),
+            !!(ctx.flags &
+               kDescFlagIrregularStaticOutputTileClassifierBoundaryHold),
+            !!(ctx.flags & kDescFlagIrregularBoundaryWritebackCoalescing),
+            !!(ctx.flags & kDescFlagIrregularStreamingBodyWriteback));
+    if (batchStepDescDecodedTicks[autopsyIdx] >= batchStepDescFetchedTicks[autopsyIdx]) {
+        const Tick delta = batchStepDescDecodedTicks[autopsyIdx] -
+                           batchStepDescFetchedTicks[autopsyIdx];
+        stats.descriptorDecodeOverheadCycles += delta / clockPeriod();
+    }
+    DPRINTF(MatrixFlowTiming,
+            "descriptorLoaded: dims=(%u,%u,%u) lda/ldb/ldc=(%u,%u,%u) "
+            "tile=(%u,%u,%u) flags=%#x batchIndex=%u batchActive=%d "
+            "baseA=%#llx baseB=%#llx baseC=%#llx\n",
+            ctx.mTotal, ctx.nTotal, ctx.kTotal,
+            ctx.lda, ctx.ldb, ctx.ldc,
+            ctx.tileM, ctx.tileN, ctx.tileK,
+            ctx.flags, batchSubproblemIndex, batchSequenceActive,
+            static_cast<unsigned long long>(ctx.baseA),
+            static_cast<unsigned long long>(ctx.baseB),
+            static_cast<unsigned long long>(ctx.baseC));
+    if (irregularSingleFusedDescriptorCornerCollapseMode() &&
+        batchSequenceActive && batchSubproblemIndex == 0) {
+        stats.singleFusedIrregularDescriptorCount++;
+        stats.fusedIrregularStateStepCount++;
+        stats.rightEdgeDescriptorNoOpCount++;
+        stats.bottomEdgeDescriptorNoOpCount++;
+        DPRINTF(MatrixFlowTiming,
+                "singleFusedIrregularDescriptor loaded: dims=(%u,%u,%u) hasRightResidue=%d hasBottomResidue=%d hasCornerResidue=%d tick=%llu\n",
+                ctx.mTotal, ctx.nTotal, ctx.kTotal,
+                ctx.ldc > ctx.nTotal,
+                ctx.ldc > ctx.mTotal,
+                ctx.ldc > ctx.nTotal && ctx.ldc > ctx.mTotal,
+                static_cast<unsigned long long>(curTick()));
+        DPRINTF(MatrixFlowTiming,
+                "fusedIrregularStateMachineBegin: index=%u tick=%llu\n",
+                batchSubproblemIndex,
+                static_cast<unsigned long long>(curTick()));
+        DPRINTF(MatrixFlowTiming,
+                "rightEdgeDescriptor converted to no-op: dims=(%u,%u,%u) batchIndex=1 satisfied_by_single_fused=1\n",
+                ctx.mTotal, 1U, ctx.kTotal);
+        DPRINTF(MatrixFlowTiming,
+                "bottomEdgeDescriptor converted to no-op: dims=(%u,%u,%u) batchIndex=2 satisfied_by_single_fused=1\n",
+                1U, ctx.nTotal, ctx.kTotal);
+    }
 
+    initIrregularBatchSharedState();
+    if (irregularStaticOutputTileClassifierBoundaryHoldMode() &&
+        batchSequenceActive && batchSubproblemIndex == 0) {
+        precomputeStaticOutputTileClassification();
+        if (irregularBoundaryWritebackCoalescingMode()) {
+            stats.boundaryWritebackCoalescingCount++;
+            DPRINTF(MatrixFlowTiming,
+                    "boundaryWritebackCoalescingEnabled: strategy=right_column_piggyback_plus_early_bottom tick=%llu\n",
+                    static_cast<unsigned long long>(curTick()));
+        }
+        if (irregularStreamingBodyWritebackMode()) {
+            stats.streamingBodyWritebackCount++;
+            DPRINTF(MatrixFlowTiming,
+                    "streamingBodyWritebackEnabled: strategy=row_band_bulk_writeback tick=%llu\n",
+                    static_cast<unsigned long long>(curTick()));
+        }
+    }
+    batchStepRunnableTicks[autopsyIdx] = curTick();
+    DPRINTF(MatrixFlowTiming,
+            "batchStepRunnable: index=%u tick=%llu\n",
+            autopsyIdx, static_cast<unsigned long long>(curTick()));
+    if (currentSubproblemIsFusedNoOp()) {
+        stats.batchNoOpStepCount++;
+        if (batchStepFirstWorkIssuedTicks[autopsyIdx] == 0) {
+            batchStepFirstWorkIssuedTicks[autopsyIdx] = curTick();
+        }
+        markBatchStepLastWorkCompleted("no_op");
+        if (irregularFusedRightEdgeCleanTimingMode() &&
+            batchSubproblemIndex == 1) {
+            stats.rightEdgeDescriptorNoOpCount++;
+            DPRINTF(MatrixFlowTiming,
+                    "rightEdgeDescriptor converted to no-op: dims=(%u,%u,%u) batchIndex=%u satisfied_by_body_fused=1\n",
+                    ctx.mTotal, ctx.nTotal, ctx.kTotal, batchSubproblemIndex);
+        } else if (irregularNoWaitFusedBottomMode() &&
+                   batchSubproblemIndex == 2) {
+            stats.bottomEdgeDescriptorNoOpCount++;
+            DPRINTF(MatrixFlowTiming,
+                    "bottomEdgeDescriptor converted to no-op: dims=(%u,%u,%u) batchIndex=%u satisfied_by_body_fused=1\n",
+                    ctx.mTotal, ctx.nTotal, ctx.kTotal, batchSubproblemIndex);
+        } else {
+            DPRINTF(MatrixFlowTiming,
+                    "fusedNoOpSubproblem: dims=(%u,%u,%u) batchIndex=%u\n",
+                    ctx.mTotal, ctx.nTotal, ctx.kTotal, batchSubproblemIndex);
+        }
+        if ((ctx.flags & kDescFlagChainContinue) && batchSubproblemIndex < 3) {
+            finishCurrentSubproblem(false);
+        } else {
+            issueWriteHeldOutputBatch();
+        }
+        return;
+    }
     prepareOutputTile();
+    if (currentSubproblemUsesFusedEdges() && irregularNoWaitFusedRightMode()) {
+        DPRINTF(MatrixFlowTiming,
+                "bodyPreludeBegin: index=%u tick=%llu btailReady=%d atailReady=%d\n",
+                batchSubproblemIndex,
+                static_cast<unsigned long long>(curTick()),
+                tailScratchpadValid, aTailScratchpadValid);
+    }
+    maybeStartIrregularPreludeLoads();
+    if (currentSubproblemUsesFusedEdges()) {
+        if (irregularFusedRightEdgeCleanTimingMode()) {
+            // Allow body to start while B-tail scratchpad loads in background.
+        } else if (!tailScratchpadValid || !aTailScratchpadValid) {
+            return;
+        }
+    }
+    if (currentSubproblemUsesTailScratchpad()) {
+        issueTailScratchpadLoad();
+        return;
+    }
+    if (currentSubproblemUsesFusedEdges() && irregularNoWaitFusedRightMode()) {
+        bodyFirstUsefulWorkIssuedTick = curTick();
+        stats.bodyStartedWithoutBTailCount++;
+        if (irregularNoWaitFusedBottomMode() ||
+            irregularSingleFusedDescriptorCornerCollapseMode()) {
+            stats.bodyStartedWithoutATailCount++;
+        }
+        DPRINTF(MatrixFlowTiming,
+                "bodyFirstUsefulWorkIssued: index=%u tick=%llu btailReady=%d\n",
+                batchSubproblemIndex,
+                static_cast<unsigned long long>(bodyFirstUsefulWorkIssuedTick),
+                tailScratchpadValid);
+        DPRINTF(MatrixFlowTiming,
+                "bodyStartedWithoutBTail: index=%u tick=%llu\n",
+                batchSubproblemIndex,
+                static_cast<unsigned long long>(bodyFirstUsefulWorkIssuedTick));
+        if (irregularNoWaitFusedBottomMode() ||
+            irregularSingleFusedDescriptorCornerCollapseMode()) {
+            DPRINTF(MatrixFlowTiming,
+                    "bodyStartedWithoutATail: index=%u tick=%llu atailReady=%d\n",
+                    batchSubproblemIndex,
+                    static_cast<unsigned long long>(
+                        bodyFirstUsefulWorkIssuedTick),
+                    aTailScratchpadValid);
+        }
+    }
     issueFetchATile();
 }
 
 void
 MatrixFlowEngine::prepareOutputTile()
 {
-    ctx.curTileM = std::min(ctx.tileM, ctx.size - ctx.i);
-    ctx.curTileN = std::min(ctx.tileN, ctx.size - ctx.j);
-    ctx.curTileK = std::min(ctx.tileK, ctx.size - ctx.k);
+    ctx.curTileM = std::min(ctx.tileM, ctx.mTotal - ctx.i);
+    ctx.curTileN = std::min(ctx.tileN, ctx.nTotal - ctx.j);
+    ctx.curTileK = std::min(ctx.tileK, ctx.kTotal - ctx.k);
 
     if (ctx.k == 0) {
         std::fill(tileCBuffer.begin(), tileCBuffer.end(), 0);
@@ -6354,6 +9032,7 @@ MatrixFlowEngine::prepareOutputTile()
 void
 MatrixFlowEngine::issueFetchATile()
 {
+    markBatchStepFirstWorkIssued();
     phase = Phase::FetchA;
 
     panic_if(ctx.curTileM > static_cast<uint32_t>(kMaxTileDim),
@@ -6411,9 +9090,7 @@ MatrixFlowEngine::issueOneFetchA()
     currentARowIssued[r] = true;
     if (tryServeCurrentARowFromVip(r, vipABRescueMode())) {
         if (smartPatternPrefetchMode()) {
-            const Addr rowAddr = ctx.baseA +
-                ((static_cast<Addr>(ctx.i + r) * ctx.size + ctx.k) *
-                 ctx.elemBytes);
+            const Addr rowAddr = matrixAAddr(ctx, ctx.i + r, ctx.k);
             stats.smartPrefetchAIssueCount++;
             if (oracleARecurrenceBucket(rowAddr) ==
                 OracleARecurrenceBucket::Repeat) {
@@ -6434,9 +9111,7 @@ MatrixFlowEngine::issueOneFetchA()
 
     const Addr rowBytes =
         static_cast<Addr>(ctx.curTileK) * ctx.elemBytes;
-    const Addr rowAddr = ctx.baseA +
-        ((static_cast<Addr>(ctx.i + r) * ctx.size + ctx.k) *
-         ctx.elemBytes);
+    const Addr rowAddr = matrixAAddr(ctx, ctx.i + r, ctx.k);
     auto *dst = tileABuffer.data() + r * rowBytes;
     auto [reqAddr, reqBytes, reqOffset] = planReadRequest(rowAddr, rowBytes);
     uint8_t *dmaDst = dst;
@@ -6466,9 +9141,7 @@ MatrixFlowEngine::issueOneFetchA()
     stats.aRowsIssued++;
     stats.rxAIssueCount++;
     if (smartPatternPrefetchMode()) {
-        const Addr oracleRowAddr = ctx.baseA +
-            ((static_cast<Addr>(ctx.i + r) * ctx.size + ctx.k) *
-             ctx.elemBytes);
+        const Addr oracleRowAddr = matrixAAddr(ctx, ctx.i + r, ctx.k);
         stats.smartPrefetchAIssueCount++;
         if (oracleARecurrenceBucket(oracleRowAddr) ==
             OracleARecurrenceBucket::Repeat) {
@@ -6561,6 +9234,39 @@ MatrixFlowEngine::issueFetchBTile()
     reqsIssuedB = prefetched_rows + inflight_rows;
     reqsCompletedB = prefetched_rows;
     targetReqsB = ctx.curTileK;
+    DPRINTF(MatrixFlowTiming,
+            "fetchBTile: dims=(%u,%u,%u) tile=(%u,%u,%u) rowBytes=%llu "
+            "targetRows=%u prefetched=%u inflight=%u\n",
+            ctx.mTotal, ctx.nTotal, ctx.kTotal,
+            ctx.curTileM, ctx.curTileN, ctx.curTileK,
+            static_cast<unsigned long long>(
+            static_cast<Addr>(ctx.curTileN) * ctx.elemBytes),
+            targetReqsB, prefetched_rows, inflight_rows);
+    if (currentSubproblemUsesTailScratchpad() && tailScratchpadValid &&
+        (tailScratchpadBaseB == ctx.baseB ||
+         ((irregularNoWaitFusedRightMode() ||
+           irregularNoWaitFusedBottomMode() ||
+           irregularSingleFusedDescriptorCornerCollapseMode()) &&
+          batchSubproblemIndex == 3))) {
+        reqsIssuedB = 0;
+        reqsCompletedB = 0;
+        populateBTileFromTailScratchpad();
+        DPRINTF(MatrixFlowTiming,
+                "fetchBTileFromTailScratchpad: dims=(%u,%u,%u) tile=(%u,%u,%u) "
+                "rowBytes=%llu targetRows=%u batchIndex=%u\n",
+                ctx.mTotal, ctx.nTotal, ctx.kTotal,
+                ctx.curTileM, ctx.curTileN, ctx.curTileK,
+                static_cast<unsigned long long>(
+                    static_cast<Addr>(ctx.curTileN) * ctx.elemBytes),
+                targetReqsB, batchSubproblemIndex);
+        if (baselineSchedulerMode()) {
+            tryLaunchComputeTile();
+            return;
+        }
+        serviceParallelFetchAB();
+        tryLaunchComputeTile();
+        return;
+    }
     nextNormalBRowCursor = 0;
     applyStagedCurrentFutureClaims();
     applyStagedCurrentVipBackedRows();
@@ -6835,9 +9541,7 @@ MatrixFlowEngine::trySendMoreNextA()
         if (r >= nextCtx.curTileM || nextPrefetchARowIssued[r]) {
             break;
         }
-        const Addr rowAddr = nextCtx.baseA +
-            ((static_cast<Addr>(nextCtx.i + r) * nextCtx.size + nextCtx.k) *
-             nextCtx.elemBytes);
+        const Addr rowAddr = matrixAAddr(nextCtx, nextCtx.i + r, nextCtx.k);
         auto *dst = nextTileABuffer.data() + r * rowBytes;
         auto [reqAddr, reqBytes, reqOffset] = planReadRequest(rowAddr, rowBytes);
         uint8_t *dmaDst = dst;
@@ -6915,10 +9619,8 @@ MatrixFlowEngine::startCoverageGatherForCurrentTile()
                 ? isSmartCoverageTargetForContext(gather_ctx, row)
                 : isCoverageBlindspotTargetPattern(
                       row, BProtectionClass::None,
-                      gather_ctx.baseB +
-                          ((static_cast<Addr>(gather_ctx.k + row) *
-                            gather_ctx.size + gather_ctx.j) *
-                           gather_ctx.elemBytes));
+                      matrixBAddr(gather_ctx, gather_ctx.k + row,
+                                  gather_ctx.j));
         if (target) {
             ++target_rows;
         }
@@ -6966,9 +9668,7 @@ MatrixFlowEngine::issueCoverageGatherRow(uint32_t rowIdx,
 
     const Addr rowBytes =
         static_cast<Addr>(gctx.curTileN) * gctx.elemBytes;
-    const Addr rowAddr = gctx.baseB +
-        ((static_cast<Addr>(gctx.k + rowIdx) * gctx.size + gctx.j) *
-         gctx.elemBytes);
+    const Addr rowAddr = matrixBAddr(gctx, gctx.k + rowIdx, gctx.j);
     auto [reqAddr, reqBytes, reqOffset] = planReadRequest(rowAddr, rowBytes);
     uint8_t *dmaDst =
         coverageGatherBBounceBuffer.data() + rowIdx * readBouncePitch;
@@ -7062,9 +9762,7 @@ MatrixFlowEngine::trySendMoreCoverageGatherB()
             if (coverageGatherBRowIssued[row]) {
                 continue;
             }
-            const Addr rowAddr = gctx.baseB +
-                ((static_cast<Addr>(gctx.k + row) * gctx.size + gctx.j) *
-                 gctx.elemBytes);
+            const Addr rowAddr = matrixBAddr(gctx, gctx.k + row, gctx.j);
             const bool target =
                 coverage2DGatherPingPongFirstCutMode()
                     ? isSmartCoverageTargetForContext(gctx, row)
@@ -7135,9 +9833,7 @@ MatrixFlowEngine::trySendMoreNextKBBudgeted()
         if (r >= nextCtx.curTileK || nextPrefetchBRowIssued[r]) {
             break;
         }
-        const Addr rowAddr = nextCtx.baseB +
-            ((static_cast<Addr>(nextCtx.k + r) * nextCtx.size + nextCtx.j) *
-             nextCtx.elemBytes);
+        const Addr rowAddr = matrixBAddr(nextCtx, nextCtx.k + r, nextCtx.j);
         auto *dst = nextTileBBuffer.data() + r * rowBytes;
         auto [reqAddr, reqBytes, reqOffset] = planReadRequest(rowAddr, rowBytes);
         uint8_t *dmaDst = dst;
@@ -7215,9 +9911,8 @@ MatrixFlowEngine::trySendMoreNextOutputB()
         if (sharedPrefetchBCredits() == 0) {
             break;
         }
-        const Addr rowAddr = nextOutputCtx.baseB +
-            ((static_cast<Addr>(nextOutputCtx.k + r) * nextOutputCtx.size +
-              nextOutputCtx.j) * nextOutputCtx.elemBytes);
+        const Addr rowAddr =
+            matrixBAddr(nextOutputCtx, nextOutputCtx.k + r, nextOutputCtx.j);
         auto *dst = nextOutputTileBBuffer.data() + r * rowBytes;
         auto [reqAddr, reqBytes, reqOffset] = planReadRequest(rowAddr, rowBytes);
         uint8_t *dmaDst = dst;
@@ -7507,6 +10202,18 @@ MatrixFlowEngine::issueWriteCTile()
         return;
     }
 
+    if (currentSubproblemUsesOutputHold()) {
+        DPRINTF(MatrixFlowTiming,
+                "writeCTileToOutputHold: dims=(%u,%u,%u) tile=(%u,%u,%u) "
+                "subBase=(%u,%u)\n",
+                ctx.mTotal, ctx.nTotal, ctx.kTotal,
+                ctx.curTileM, ctx.curTileN, ctx.curTileK,
+                currentSubproblemRowBase, currentSubproblemColBase);
+        storeCurrentTileToOutputHold();
+        advanceTile();
+        return;
+    }
+
     reqsIssuedC = 0;
     reqsCompletedC = 0;
     targetReqsC = ctx.curTileM;
@@ -7520,6 +10227,14 @@ MatrixFlowEngine::issueWriteCTile()
         nextPrefetchReqsIssuedB + nextOutputPrefetchReqsIssuedB;
     writeCPrevNextOutputCompletedB = nextOutputPrefetchRowsBCompleted;
     writeCBRowsIssued = 0;
+    DPRINTF(MatrixFlowTiming,
+            "writeCTile: dims=(%u,%u,%u) tile=(%u,%u,%u) rowBytes=%llu "
+            "rows=%u cols=%u\n",
+            ctx.mTotal, ctx.nTotal, ctx.kTotal,
+            ctx.curTileM, ctx.curTileN, ctx.curTileK,
+            static_cast<unsigned long long>(
+                static_cast<Addr>(ctx.curTileN) * ctx.elemBytes),
+            ctx.curTileM, ctx.curTileN);
     if (writeCOverlapWindowActive) {
         stats.writeCOverlapEnabledCount++;
         serviceWriteCOverlap();
@@ -7536,9 +10251,7 @@ MatrixFlowEngine::trySendMoreC()
     while (reqsIssuedC < targetReqsC &&
            (reqsIssuedC - reqsCompletedC) < kMaxInFlight) {
         const uint32_t r = reqsIssuedC;
-        const Addr rowAddr = ctx.baseC +
-            ((static_cast<Addr>(ctx.i + r) * ctx.size + ctx.j) *
-             ctx.elemBytes);
+        const Addr rowAddr = matrixCAddr(ctx, ctx.i + r, ctx.j);
         auto *src = tileCBuffer.data() + r * rowBytes;
 
         DPRINTF(MatrixFlow,
@@ -7559,6 +10272,7 @@ MatrixFlowEngine::trySendMoreC()
 void
 MatrixFlowEngine::issueWriteFlag()
 {
+    markBatchStepFirstWorkIssued();
     phase = Phase::WriteFlag;
     if (hierarchicalProtectedBSchedulerMode()) {
         warn("%s: hier-trace issueWriteFlag flag=%#llx value=%llu\n",
@@ -7571,6 +10285,16 @@ MatrixFlowEngine::issueWriteFlag()
             static_cast<unsigned long long>(ctx.flagAddr),
             static_cast<unsigned long long>(completionFlagValue));
 
+    if (deviceCompletionFlagWriteBeginTick == 0) {
+        deviceCompletionFlagWriteBeginTick = curTick();
+    }
+    DPRINTF(MatrixFlowTiming,
+            "deviceCompletionFlagWriteBegin: tick=%llu autopsyActive=%d flags=%#x\n",
+            static_cast<unsigned long long>(
+                deviceCompletionFlagWriteBeginTick),
+            finalCompletionChainAutopsyActive, ctx.flags);
+    completionVisibleWriteStartTick = curTick();
+    stats.completionVisibleWriteCount++;
     stats.totalDmaBytesWritten += sizeof(completionFlagValue);
     dmaPort.dmaAction(
         MemCmd::WriteReq, ctx.flagAddr, sizeof(completionFlagValue),
@@ -7603,17 +10327,13 @@ MatrixFlowEngine::onFetchARowComplete(uint32_t rowIdx)
         stats.aFetchProgressDuringBFetch++;
     }
     updateABParallelOverlapTracking();
-    const Addr oracleRowAddr = ctx.baseA +
-        ((static_cast<Addr>(ctx.i + rowIdx) * ctx.size + ctx.k) *
-         ctx.elemBytes);
+    const Addr oracleRowAddr = matrixAAddr(ctx, ctx.i + rowIdx, ctx.k);
     recordCurrentAOracleOutcome(oracleRowAddr, false);
 
     if (shouldAdmitVipRescueARow(rowIdx)) {
         const Addr rowBytes =
             static_cast<Addr>(ctx.curTileK) * ctx.elemBytes;
-        const Addr rowAddr = ctx.baseA +
-            ((static_cast<Addr>(ctx.i + rowIdx) * ctx.size + ctx.k) *
-             ctx.elemBytes);
+        const Addr rowAddr = matrixAAddr(ctx, ctx.i + rowIdx, ctx.k);
         const uint32_t future_reuse = rescueFutureJTileReuseCount();
         const bool short_next_use = rescueANextUseIsShort();
         const VipAdmitClass admit =
@@ -7684,9 +10404,7 @@ MatrixFlowEngine::onFetchBRowComplete(uint32_t rowIdx)
     if (vipRescueMode()) {
         const Addr rowBytes =
             static_cast<Addr>(ctx.curTileN) * ctx.elemBytes;
-        const Addr rowAddr = ctx.baseB +
-            ((static_cast<Addr>(ctx.k + rowIdx) * ctx.size + ctx.j) *
-             ctx.elemBytes);
+        const Addr rowAddr = matrixBAddr(ctx, ctx.k + rowIdx, ctx.j);
         const uint32_t repeat_count = ++bFallbackVictimCount[rowAddr];
         const uint32_t future_reuse = rescueFutureITileReuseCount();
         const bool short_next_use = rescueNextUseIsShort();
@@ -7798,9 +10516,7 @@ MatrixFlowEngine::onFetchBRowComplete(uint32_t rowIdx)
         mhotCoverageBlindspotCandidateMode()) {
         const Addr rowBytes =
             static_cast<Addr>(ctx.curTileN) * ctx.elemBytes;
-        const Addr rowAddr = ctx.baseB +
-            ((static_cast<Addr>(ctx.k + rowIdx) * ctx.size + ctx.j) *
-             ctx.elemBytes);
+        const Addr rowAddr = matrixBAddr(ctx, ctx.k + rowIdx, ctx.j);
         OracleSourceClass hotOracleSrc = currentBOracleSource[rowIdx];
         if (hotOracleSrc == OracleSourceClass::Normal) {
             hotOracleSrc = oracleSourceFromProtectionClass(
@@ -7834,9 +10550,7 @@ MatrixFlowEngine::onFetchBRowComplete(uint32_t rowIdx)
     if (mhotCoverageBlindspotCandidateMode()) {
         const Addr rowBytes =
             static_cast<Addr>(ctx.curTileN) * ctx.elemBytes;
-        const Addr rowAddr = ctx.baseB +
-            ((static_cast<Addr>(ctx.k + rowIdx) * ctx.size + ctx.j) *
-             ctx.elemBytes);
+        const Addr rowAddr = matrixBAddr(ctx, ctx.k + rowIdx, ctx.j);
         if (isCoverageBlindspotNormalCandidate(
                 rowIdx, currentBProtectionClass[rowIdx], rowAddr)) {
             const uint64_t patternKey =
@@ -8106,9 +10820,9 @@ MatrixFlowEngine::onNextFetchBRowComplete(uint32_t rowIdx)
         isSmartCoverageTargetForContext(nextCtx, rowIdx)) {
         const Addr rowBytes =
             static_cast<Addr>(nextCtx.curTileN) * nextCtx.elemBytes;
-        const Addr rowAddr = nextCtx.baseB +
-            ((static_cast<Addr>(nextCtx.k + rowIdx) * nextCtx.size +
-              nextCtx.j) * nextCtx.elemBytes);
+        const Addr rowAddr = matrixBAddr(nextCtx,
+                                         nextCtx.k + rowIdx,
+                                         nextCtx.j);
         tryInsertCoverageShadowRow(
             rowAddr, rowBytes,
             nextTileBBuffer.data() + rowIdx * rowBytes,
@@ -8162,9 +10876,7 @@ MatrixFlowEngine::onNextOutputFetchBRowComplete(uint32_t rowIdx)
         ++carryOverBRowsCompleted;
         const Addr rowBytes =
             static_cast<Addr>(ctx.curTileN) * ctx.elemBytes;
-        const Addr rowAddr = ctx.baseB +
-            ((static_cast<Addr>(ctx.k + rowIdx) * ctx.size + ctx.j) *
-             ctx.elemBytes);
+        const Addr rowAddr = matrixBAddr(ctx, ctx.k + rowIdx, ctx.j);
         const OracleDistanceBucket dist =
             oracleDistanceBucket(rowIdx, targetReqsB);
         bool servedFromVip = false;
@@ -8219,11 +10931,42 @@ MatrixFlowEngine::onNextOutputFetchBRowComplete(uint32_t rowIdx)
             stats.nextOutputProgressDuringWriteC++;
         }
         if (!servedFromVip) {
-            panic_if(
-                reqsCompletedB >= targetReqsB,
-                "%s: carry-over completion reqsCompletedB=%u >= "
-                "targetReqsB=%u\n",
-                name(), reqsCompletedB, targetReqsB);
+            if (reqsCompletedB >= targetReqsB) {
+                stats.nextPrefetchLateCompletionCount++;
+                stats.nextOutputPrefetchLateCompletionCount++;
+                stats.carryOverLateCompletionCount++;
+                DPRINTF(MatrixFlow,
+                        "ignore saturated carry-over completion: row=%u "
+                        "rowGen=%llu completed=%u target=%u state=%d\n",
+                        rowIdx, static_cast<unsigned long long>(rowGen),
+                        reqsCompletedB, targetReqsB,
+                        static_cast<int>(currentBRowState[rowIdx]));
+                if (carryOverBRowsCompleted == carryOverBRowsIssued) {
+                    carryOverBActive = false;
+                    carryOverBGeneration = 0;
+                    carryOverBRowsIssued = 0;
+                    carryOverBRowsCompleted = 0;
+                    carryOverBRowsTarget = 0;
+                }
+                if (reqsCompletedA < targetReqsA) {
+                    stats.bFetchProgressDuringAFetch++;
+                }
+                updateABParallelOverlapTracking();
+                if (baselineSchedulerMode()) {
+                    trySendMoreB();
+                    tryLaunchComputeTile();
+                    return;
+                }
+                serviceParallelFetchAB();
+                if (reqsCompletedB == targetReqsB &&
+                    reqsCompletedA < targetReqsA &&
+                    !bWaitedForAThisTile) {
+                    stats.bPathStallWaitingForA++;
+                    bWaitedForAThisTile = true;
+                }
+                tryLaunchComputeTile();
+                return;
+            }
             ++reqsCompletedB;
             stats.rxBReadyCount++;
         }
@@ -8296,16 +11039,22 @@ MatrixFlowEngine::onNextOutputFetchBRowComplete(uint32_t rowIdx)
             return;
         }
 
-        panic_if(reqsCompletedB >= targetReqsB,
-                 "%s: claimed future completion reqsCompletedB=%u >= "
-                 "targetReqsB=%u\n",
-                 name(), reqsCompletedB, targetReqsB);
+        if (reqsCompletedB >= targetReqsB) {
+            stats.nextPrefetchLateCompletionCount++;
+            stats.nextOutputPrefetchLateCompletionCount++;
+            DPRINTF(MatrixFlow,
+                    "ignore saturated claimed-future completion: row=%u "
+                    "rowGen=%llu completed=%u target=%u state=%d\n",
+                    rowIdx, static_cast<unsigned long long>(rowGen),
+                    reqsCompletedB, targetReqsB,
+                    static_cast<int>(currentBRowState[rowIdx]));
+            arbitratePrefetchBIssues();
+            return;
+        }
         const BProtectionClass claimCls = currentBFutureClaimClass[rowIdx];
         const Addr rowBytes =
             static_cast<Addr>(ctx.curTileN) * ctx.elemBytes;
-        const Addr rowAddr = ctx.baseB +
-            ((static_cast<Addr>(ctx.k + rowIdx) * ctx.size + ctx.j) *
-             ctx.elemBytes);
+        const Addr rowAddr = matrixBAddr(ctx, ctx.k + rowIdx, ctx.j);
         const OracleDistanceBucket dist =
             oracleDistanceBucket(rowIdx, targetReqsB);
         bool servedFromVip = false;
@@ -8402,10 +11151,9 @@ MatrixFlowEngine::onNextOutputFetchBRowComplete(uint32_t rowIdx)
         const Addr rowBytes =
             static_cast<Addr>(nextOutputCtx.curTileN) *
             nextOutputCtx.elemBytes;
-        const Addr rowAddr = nextOutputCtx.baseB +
-            ((static_cast<Addr>(nextOutputCtx.k + rowIdx) *
-              nextOutputCtx.size + nextOutputCtx.j) *
-             nextOutputCtx.elemBytes);
+        const Addr rowAddr =
+            matrixBAddr(nextOutputCtx, nextOutputCtx.k + rowIdx,
+                        nextOutputCtx.j);
         tryInsertCoverageShadowRow(
             rowAddr, rowBytes,
             nextOutputTileBBuffer.data() + rowIdx * rowBytes,
@@ -8414,10 +11162,9 @@ MatrixFlowEngine::onNextOutputFetchBRowComplete(uint32_t rowIdx)
     {
         const Addr rowBytes =
             static_cast<Addr>(nextOutputCtx.curTileN) * nextOutputCtx.elemBytes;
-        const Addr rowAddr = nextOutputCtx.baseB +
-            ((static_cast<Addr>(nextOutputCtx.k + rowIdx) *
-              nextOutputCtx.size + nextOutputCtx.j) *
-             nextOutputCtx.elemBytes);
+        const Addr rowAddr =
+            matrixBAddr(nextOutputCtx, nextOutputCtx.k + rowIdx,
+                        nextOutputCtx.j);
         const OracleDistanceBucket dist =
             oracleDistanceBucket(rowIdx, nextOutputCtx.curTileK);
         const BProtectionClass vipCls =
@@ -8515,9 +11262,7 @@ MatrixFlowEngine::onCoverageGatherBRowComplete(uint32_t rowIdx)
         coverage2DGatherPingPongFirstCutMode() ? coverageGatherCtx : ctx;
     const Addr rowBytes =
         static_cast<Addr>(gctx.curTileN) * gctx.elemBytes;
-    const Addr rowAddr = gctx.baseB +
-        ((static_cast<Addr>(gctx.k + rowIdx) * gctx.size + gctx.j) *
-         gctx.elemBytes);
+    const Addr rowAddr = matrixBAddr(gctx, gctx.k + rowIdx, gctx.j);
     bool inserted = false;
     if (coverage2DGatherPingPongFirstCutMode()) {
         inserted = tryInsertCoverageShadowRowInBank(
@@ -8570,6 +11315,10 @@ MatrixFlowEngine::launchComputeTile()
 
     const uint64_t tileCycles = estimateTileCycles(
         ctx.curTileM, ctx.curTileN, ctx.curTileK);
+    const char *kernelVariant =
+        ctx.curTileM == 1 && ctx.curTileN == 1 ? "scalar_corner" :
+        (ctx.curTileN == 1 ? "skinny_n_rect" :
+         (ctx.curTileM == 1 ? "skinny_m_rect" : "rect_generic"));
     const Tick doneAt = curTick() + clockPeriod() * tileCycles;
 
     DPRINTF(MatrixFlow,
@@ -8581,6 +11330,13 @@ MatrixFlowEngine::launchComputeTile()
             computeLaunchWindowA(), computeLaunchWindowB(),
             static_cast<unsigned long long>(tileCycles),
             static_cast<unsigned long long>(doneAt));
+    DPRINTF(MatrixFlowTiming,
+            "launchCompute: dims=(%u,%u,%u) tile=(%u,%u,%u) "
+            "kernel=%s output_cols=%u effective_n=%u cycles=%llu\n",
+            ctx.mTotal, ctx.nTotal, ctx.kTotal,
+            ctx.curTileM, ctx.curTileN, ctx.curTileK,
+            kernelVariant, ctx.curTileN, ctx.curTileN,
+            static_cast<unsigned long long>(tileCycles));
     if (hierarchicalProtectedBSchedulerMode()) {
         warn("%s: hier-trace launchCompute i=%u j=%u k=%u "
              "readyA=%u/%u readyB=%u/%u winA=%u winB=%u cycles=%llu\n",
@@ -8621,23 +11377,52 @@ void
 MatrixFlowEngine::advanceTile()
 {
     ctx.k = 0;
-    if (ctx.j + ctx.curTileN < ctx.size) {
+    if (ctx.j + ctx.curTileN < ctx.nTotal) {
         ctx.j += ctx.curTileN;
     } else {
         ctx.j = 0;
         ctx.i += ctx.curTileM;
     }
 
-    if (ctx.i >= ctx.size) {
+    if (ctx.i >= ctx.mTotal) {
+        markBatchStepLastWorkCompleted("all_tiles_done");
+        finalUsefulWorkDoneTick = curTick();
+        DPRINTF(MatrixFlowTiming,
+                "finalUsefulWorkDone: index=%u tick=%llu\n",
+                batchSubproblemIndex,
+                static_cast<unsigned long long>(finalUsefulWorkDoneTick));
         DPRINTF(MatrixFlow,
-                "MatrixFlow DMA complete: A=%#llx B=%#llx C=%#llx size=%u "
+                "MatrixFlow DMA complete: A=%#llx B=%#llx C=%#llx "
+                "dims=(%u,%u,%u) "
                 "complete@%llu\n",
                 static_cast<unsigned long long>(pendingMatrixA),
                 static_cast<unsigned long long>(pendingMatrixB),
                 static_cast<unsigned long long>(pendingResult),
-                pendingSize,
+                pendingM, pendingN, pendingK,
                 static_cast<unsigned long long>(curTick()));
-        issueWriteFlag();
+        if (irregularSingleFusedDescriptorCornerCollapseMode()) {
+            stats.fusedIrregularStateStepCount++;
+            DPRINTF(MatrixFlowTiming,
+                    "fusedIrregularStateTransition: state=body_complete next=corner_collapsed_writeback tick=%llu\n",
+                    static_cast<unsigned long long>(curTick()));
+            DPRINTF(MatrixFlowTiming,
+                    "cornerNoLongerIndependent: tick=%llu collapsed=%d\n",
+                    static_cast<unsigned long long>(curTick()),
+                    cornerCollapseActivatedThisBatch);
+        }
+        if (irregularBoundaryOnlyHoldEarlyBodyWritebackMode() &&
+            currentSubproblemUsesOutputHold()) {
+            issueBoundaryOnlyFinalWriteback();
+        } else if (irregularSingleFusedDescriptorCornerCollapseMode() &&
+            currentSubproblemUsesOutputHold()) {
+            issueWriteHeldOutputBatch();
+        } else if (ctx.flags & kDescFlagSuppressCompletion) {
+            finishCurrentSubproblem(false);
+        } else if (currentSubproblemUsesOutputHold()) {
+            issueWriteHeldOutputBatch();
+        } else {
+            issueWriteFlag();
+        }
         return;
     }
 
@@ -8652,6 +11437,9 @@ MatrixFlowEngine::advanceTile()
             std::min(nextOutputPrefetchRowsBCompleted, nextOutputCtx.curTileK);
         stats.nextOutputRowsReadyAtBoundary += rows_ready;
     }
+    const bool multiTailFusedBody =
+        currentSubproblemUsesFusedEdges() &&
+        (irregularTailRows() > 1 || irregularTailCols() > 1);
     if (nextOutputPrefetchMatchesCurrentTile() && nextOutputPrefetchReadyB) {
         if (nextOutputFirstIssueTick != 0) {
             const Tick headstart_delta = curTick() - nextOutputFirstIssueTick;
@@ -8660,7 +11448,8 @@ MatrixFlowEngine::advanceTile()
         }
         applyPrefetchedNextOutputTile();
     } else if (nextOutputPrefetchMatchesCurrentTile() &&
-               nextOutputPrefetchRowsBCompleted > 0) {
+               nextOutputPrefetchRowsBCompleted > 0 &&
+               !multiTailFusedBody) {
         const uint32_t rows_cap = carryOverMaxRowsConfig == 0
             ? nextOutputCtx.curTileK
             : std::min(nextOutputCtx.curTileK, carryOverMaxRowsConfig);
@@ -8723,9 +11512,7 @@ MatrixFlowEngine::advanceTile()
                     continue;
                 }
                 stageCurrentOracleVipSelectedRow(row);
-                const Addr rowAddr = ctx.baseB +
-                    ((static_cast<Addr>(ctx.k + row) * ctx.size + ctx.j) *
-                     ctx.elemBytes);
+                const Addr rowAddr = matrixBAddr(ctx, ctx.k + row, ctx.j);
                 if (!tryInsertVipRow(rowAddr, rowBytes,
                                      tileBBuffer.data() + row * rowBytes,
                                      VipSourceClass::CarryOver,
@@ -8793,20 +11580,10 @@ MatrixFlowEngine::startMatrixCompute(
         return;
     }
 
-    computeBusy = true;
-    pendingDescAddr = descriptorAddr;
-    hierarchicalDebugComputeDeferCount = 0;
-    clearFallbackAutopsyTracking();
-    if (hierarchicalProtectedBSchedulerMode()) {
-        warn("%s: hier-trace startMatrixCompute accepted desc=%#llx\n",
-             name(), static_cast<unsigned long long>(descriptorAddr));
-    }
-
-    DPRINTF(MatrixFlow,
-            "startMatrixCompute: descriptor=%#llx\n",
-            static_cast<unsigned long long>(descriptorAddr));
-
-    issueFetchDescriptor();
+    batchSequenceActive = false;
+    nextBatchDescAddr = 0;
+    batchSubproblemIndex = 0;
+    startDescriptorInternal(descriptorAddr, false);
 }
 
 void
@@ -8867,6 +11644,17 @@ MatrixFlowEngine::processComputeDone()
         currentBRowState[r] = BRowState::Consumed;
     }
     accumulateCurrentTile();
+    if (currentSubproblemUsesFusedEdges()) {
+        accumulateFusedRightEdgeFromCurrentATile();
+        if (irregularFusedEdgesCompletionOptimizedMode() ||
+            irregularNoWaitFusedBottomMode()) {
+            accumulateFusedBottomEdgeFromCurrentBTile();
+        }
+        if (irregularFusedEdgesCompletionOptimizedMode() ||
+            irregularSingleFusedDescriptorCornerCollapseMode()) {
+            accumulateFusedCornerFromCurrentTiles();
+        }
+    }
 
     DPRINTF(MatrixFlow,
             "processComputeDone: tile i=%u j=%u k=%u dims=(%u,%u,%u) "
@@ -8877,7 +11665,7 @@ MatrixFlowEngine::processComputeDone()
             static_cast<unsigned long long>(pendingResult),
             static_cast<unsigned long long>(curTick()));
 
-    if (ctx.k + ctx.curTileK < ctx.size) {
+    if (ctx.k + ctx.curTileK < ctx.kTotal) {
         ctx.k += ctx.curTileK;
         prepareOutputTile();
         if (nextPrefetchMatchesCurrentTile() && nextPrefetchReadyB) {
@@ -8904,6 +11692,192 @@ MatrixFlowEngine::processComputeDone()
 }
 
 void
+MatrixFlowEngine::finishCurrentSubproblem(bool writeCompletion)
+{
+    accumulateResidualAutopsyAtFinish(writeCompletion);
+    stats.batchInternalCompletionCount++;
+    const uint64_t subproblemDmaRead =
+        static_cast<uint64_t>(stats.totalDmaBytesRead.value()) -
+        subproblemStartDmaRead;
+    const uint64_t subproblemDmaWrite =
+        static_cast<uint64_t>(stats.totalDmaBytesWritten.value()) -
+        subproblemStartDmaWrite;
+    const uint64_t subproblemComputeCycles =
+        static_cast<uint64_t>(stats.totalComputeCycles.value()) -
+        subproblemStartComputeCycles;
+
+    DPRINTF(MatrixFlowTiming,
+            "MatrixFlow subproblem done: flag=%#llx value=%llu "
+            "dims=(%u,%u,%u) batch=%d index=%u dmaRead=%llu dmaWrite=%llu "
+            "computeCycles=%llu writeCompletion=%d\n",
+            static_cast<unsigned long long>(pendingFlagAddr),
+            static_cast<unsigned long long>(completionFlagValue),
+            pendingM, pendingN, pendingK,
+            batchSequenceActive, batchSubproblemIndex,
+            static_cast<unsigned long long>(subproblemDmaRead),
+            static_cast<unsigned long long>(subproblemDmaWrite),
+            static_cast<unsigned long long>(subproblemComputeCycles),
+            writeCompletion);
+
+    if (irregularFinalCompletionChainAutopsyMode() && writeCompletion &&
+        finalUsefulWorkDoneTick != 0 && deviceCompletionFullyVisibleTick != 0 &&
+        deviceCompletionFullyVisibleTick >= finalUsefulWorkDoneTick) {
+        const Tick writeback_begin =
+            finalWritebackBeginTick != 0 ? finalWritebackBeginTick :
+                                           finalUsefulWorkDoneTick;
+        const Tick writeback_issued =
+            finalWritebackIssuedTick != 0 ? finalWritebackIssuedTick :
+                                            writeback_begin;
+        const Tick writeback_drained =
+            finalWritebackAllResponsesDrainedTick != 0 ?
+                finalWritebackAllResponsesDrainedTick : writeback_issued;
+        const Tick eligibility =
+            completionEligibilitySatisfiedTick != 0 ?
+                completionEligibilitySatisfiedTick : writeback_drained;
+        const Tick token_begin =
+            deviceCompletionFlagWriteBeginTick != 0 ?
+                deviceCompletionFlagWriteBeginTick : eligibility;
+        const Tick token_end =
+            deviceCompletionFlagWriteEndTick != 0 ?
+                deviceCompletionFlagWriteEndTick : token_begin;
+        const Tick visible = deviceCompletionFullyVisibleTick;
+
+        stats.finalCompletionCycles +=
+            (visible - finalUsefulWorkDoneTick) / clockPeriod();
+        stats.finalWritebackDrainCycles +=
+            (writeback_issued - finalUsefulWorkDoneTick) / clockPeriod();
+        stats.writebackResponseDrainCycles +=
+            (writeback_drained - writeback_issued) / clockPeriod();
+        stats.completionEligibilityCycles +=
+            (token_begin - writeback_drained) / clockPeriod();
+        stats.completionTokenWriteCycles +=
+            (token_end - token_begin) / clockPeriod();
+        stats.completionVisibilityCycles +=
+            (visible - token_end) / clockPeriod();
+        DPRINTF(MatrixFlowTiming,
+                "finalCompletionChainSummary: totalCycles=%llu finalWritebackDrainCycles=%llu "
+                "writebackResponseDrainCycles=%llu completionEligibilityCycles=%llu "
+                "completionTokenWriteCycles=%llu completionVisibilityCycles=%llu\n",
+                static_cast<unsigned long long>(
+                    (visible - finalUsefulWorkDoneTick) / clockPeriod()),
+                static_cast<unsigned long long>(
+                    (writeback_issued - finalUsefulWorkDoneTick) /
+                    clockPeriod()),
+                static_cast<unsigned long long>(
+                    (writeback_drained - writeback_issued) / clockPeriod()),
+                static_cast<unsigned long long>(
+                    (token_begin - writeback_drained) / clockPeriod()),
+                static_cast<unsigned long long>(
+                    (token_end - token_begin) / clockPeriod()),
+                static_cast<unsigned long long>(
+                    (visible - token_end) / clockPeriod()));
+    }
+
+    if (!(irregularSingleFusedDescriptorCornerCollapseMode() &&
+          batchSequenceActive && batchSubproblemIndex == 0)) {
+        stats.legacyBatchSubproblemCount++;
+    }
+    if (batchSequenceActive && batchSubproblemIndex == 3) {
+        stats.cornerIndependentExecutionCount++;
+        stats.cornerIndependentActiveCycles += subproblemComputeCycles;
+    }
+
+    if (irregularSingleFusedDescriptorCornerCollapseMode() &&
+        batchSequenceActive && batchSubproblemIndex == 0) {
+        stats.fusedIrregularStateStepCount++;
+        DPRINTF(MatrixFlowTiming,
+                "fusedIrregularStateMachineEnd: tick=%llu writeCompletion=%d\n",
+                static_cast<unsigned long long>(curTick()),
+                writeCompletion);
+        if (batchSequenceActive) {
+            stats.peeledBatchSubproblemCount++;
+            if (writeCompletion) {
+                stats.peeledBatchCompletionCount++;
+            }
+        }
+        resetContext();
+        return;
+    }
+
+    if (batchSequenceActive && (ctx.flags & kDescFlagChainContinue)) {
+        const Addr nextDescAddr = nextBatchDescAddr;
+        const uint32_t nextIndex = batchSubproblemIndex + 1;
+        const bool preserveIrregular = irregularBTailScratchpadOutputHoldActive;
+        const bool preserveFused = irregularFusedEdgesCompletionOptimizedActive;
+        const Addr preserveRootBaseB = irregularBatchRootBaseB;
+        const Addr preserveRootBaseC = irregularBatchRootBaseC;
+        const uint32_t preserveRootLdb = irregularBatchRootLdb;
+        const uint32_t preserveRootLdc = irregularBatchRootLdc;
+        const uint32_t preserveBodyRows = irregularBatchBodyRows;
+        const uint32_t preserveBodyCols = irregularBatchBodyCols;
+        const bool preserveTailValid = tailScratchpadValid;
+        const Addr preserveTailBaseB = tailScratchpadBaseB;
+        const uint32_t preserveTailRows = tailScratchpadRows;
+        const uint32_t preserveTailCols = tailScratchpadCols;
+        auto preserveTailBuffer = tailScratchpadBuffer;
+        const bool preserveATailValid = aTailScratchpadValid;
+        const Addr preserveATailBaseA = aTailScratchpadBaseA;
+        const uint32_t preserveATailRows = aTailScratchpadRows;
+        const uint32_t preserveATailCols = aTailScratchpadCols;
+        auto preserveATailBuffer = aTailScratchpadBuffer;
+        const bool preserveOutputHold = outputHoldActive;
+        const Addr preserveOutputBaseC = outputHoldBaseC;
+        const uint32_t preserveOutputRows = outputHoldRows;
+        const uint32_t preserveOutputCols = outputHoldCols;
+        const uint32_t preserveOutputLdc = outputHoldLdc;
+        auto preserveOutputBuffer = outputHoldBuffer;
+        batchTransitionBeginTicks[nextIndex] = curTick();
+        DPRINTF(MatrixFlowTiming,
+                "batchTransitionBegin: from_index=%u to_index=%u tick=%llu\n",
+                batchSubproblemIndex, nextIndex,
+                static_cast<unsigned long long>(curTick()));
+        DPRINTF(MatrixFlowTiming,
+                "MatrixFlow batch step: nextDescriptor=%#llx index=%u\n",
+                static_cast<unsigned long long>(nextDescAddr), nextIndex);
+        stats.peeledBatchSubproblemCount++;
+        resetContext();
+        batchSequenceActive = true;
+        nextBatchDescAddr = nextDescAddr + sizeof(Descriptor);
+        batchSubproblemIndex = nextIndex;
+        irregularBTailScratchpadOutputHoldActive = preserveIrregular;
+        irregularFusedEdgesCompletionOptimizedActive = preserveFused;
+        irregularBatchRootBaseB = preserveRootBaseB;
+        irregularBatchRootBaseC = preserveRootBaseC;
+        irregularBatchRootLdb = preserveRootLdb;
+        irregularBatchRootLdc = preserveRootLdc;
+        irregularBatchBodyRows = preserveBodyRows;
+        irregularBatchBodyCols = preserveBodyCols;
+        tailScratchpadValid = preserveTailValid;
+        tailScratchpadBaseB = preserveTailBaseB;
+        tailScratchpadRows = preserveTailRows;
+        tailScratchpadCols = preserveTailCols;
+        tailScratchpadBuffer = std::move(preserveTailBuffer);
+        aTailScratchpadValid = preserveATailValid;
+        aTailScratchpadBaseA = preserveATailBaseA;
+        aTailScratchpadRows = preserveATailRows;
+        aTailScratchpadCols = preserveATailCols;
+        aTailScratchpadBuffer = std::move(preserveATailBuffer);
+        outputHoldActive = preserveOutputHold;
+        outputHoldBaseC = preserveOutputBaseC;
+        outputHoldRows = preserveOutputRows;
+        outputHoldCols = preserveOutputCols;
+        outputHoldLdc = preserveOutputLdc;
+        outputHoldBuffer = std::move(preserveOutputBuffer);
+        startDescriptorInternal(nextDescAddr, true);
+        return;
+    }
+
+    if (batchSequenceActive) {
+        stats.peeledBatchSubproblemCount++;
+        if (writeCompletion) {
+            stats.peeledBatchCompletionCount++;
+        }
+    }
+
+    resetContext();
+}
+
+void
 MatrixFlowEngine::onWriteFlagComplete()
 {
     if (hierarchicalProtectedBSchedulerMode()) {
@@ -8911,15 +11885,44 @@ MatrixFlowEngine::onWriteFlagComplete()
              name(), static_cast<unsigned long long>(pendingFlagAddr),
              static_cast<unsigned long long>(completionFlagValue));
     }
-    DPRINTF(MatrixFlow,
+    const uint64_t subproblemDmaRead =
+        static_cast<uint64_t>(stats.totalDmaBytesRead.value()) -
+        subproblemStartDmaRead;
+    const uint64_t subproblemDmaWrite =
+        static_cast<uint64_t>(stats.totalDmaBytesWritten.value()) -
+        subproblemStartDmaWrite;
+    const uint64_t subproblemComputeCycles =
+        static_cast<uint64_t>(stats.totalComputeCycles.value()) -
+        subproblemStartComputeCycles;
+    deviceCompletionFlagWriteEndTick = curTick();
+    DPRINTF(MatrixFlowTiming,
+            "deviceCompletionFlagWriteEnd: tick=%llu autopsyActive=%d flags=%#x\n",
+            static_cast<unsigned long long>(deviceCompletionFlagWriteEndTick),
+            finalCompletionChainAutopsyActive, ctx.flags);
+    if (completionVisibleWriteStartTick != 0 && curTick() >= completionVisibleWriteStartTick) {
+        stats.completionFinalVisibleLatency +=
+            (curTick() - completionVisibleWriteStartTick) / clockPeriod();
+    }
+    DPRINTF(MatrixFlowTiming,
+            "deviceCompletionFlagWrite: tick=%llu\n",
+            static_cast<unsigned long long>(curTick()));
+    stats.batchGuestVisibleCompletionCount++;
+    DPRINTF(MatrixFlowTiming,
             "MatrixFlow completion flag written: flag=%#llx value=%llu "
-            "dmaRead=%llu dmaWrite=%llu computeCycles=%llu\n",
+            "dims=(%u,%u,%u) dmaRead=%llu dmaWrite=%llu computeCycles=%llu\n",
             static_cast<unsigned long long>(pendingFlagAddr),
             static_cast<unsigned long long>(completionFlagValue),
-            static_cast<unsigned long long>(stats.totalDmaBytesRead.value()),
-            static_cast<unsigned long long>(stats.totalDmaBytesWritten.value()),
-            static_cast<unsigned long long>(stats.totalComputeCycles.value()));
-    resetContext();
+            pendingM, pendingN, pendingK,
+            static_cast<unsigned long long>(subproblemDmaRead),
+            static_cast<unsigned long long>(subproblemDmaWrite),
+            static_cast<unsigned long long>(subproblemComputeCycles));
+    deviceCompletionFullyVisibleTick = curTick();
+    DPRINTF(MatrixFlowTiming,
+            "deviceCompletionFullyVisible: tick=%llu autopsyActive=%d flags=%#x\n",
+            static_cast<unsigned long long>(
+                deviceCompletionFullyVisibleTick),
+            finalCompletionChainAutopsyActive, ctx.flags);
+    finishCurrentSubproblem(true);
 }
 
 void

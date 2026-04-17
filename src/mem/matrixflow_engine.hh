@@ -1,7 +1,9 @@
 #ifndef __MEM_MATRIXFLOW_ENGINE_HH__
 #define __MEM_MATRIXFLOW_ENGINE_HH__
 
+#include <array>
 #include <cstdint>
+#include <deque>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -21,6 +23,7 @@ class MatrixFlowEngine : public ClockedObject
   private:
     /** Max tile dimension; buffer size and concurrent row DMA event pool. */
     static constexpr int kMaxTileDim = 128;
+    static constexpr int kMaxBoundaryWriteEvents = 1024;
     /** Max bytes in one logical B row. */
     static constexpr size_t kMaxTileRowBytes =
         kMaxTileDim * sizeof(uint32_t);
@@ -221,11 +224,44 @@ class MatrixFlowEngine : public ClockedObject
         uint64_t addrB = 0;
         uint64_t addrC = 0;
         uint64_t flagAddr = 0;
-        uint32_t size = 0;
+        uint32_t m = 0;
+        uint32_t n = 0;
+        uint32_t k = 0;
+        uint32_t lda = 0;
+        uint32_t ldb = 0;
+        uint32_t ldc = 0;
+        uint32_t flags = 0;
+        uint64_t completionValue = 0;
     };
 
-    static_assert(sizeof(Descriptor) == 40,
+    static_assert(sizeof(Descriptor) == 72,
                   "MatrixFlow descriptor layout must stay stable");
+
+    static constexpr uint32_t kDescFlagChainContinue = 1u << 0;
+    static constexpr uint32_t kDescFlagSuppressCompletion = 1u << 1;
+    static constexpr uint32_t kDescFlagPeeledSubproblem = 1u << 2;
+    static constexpr uint32_t
+        kDescFlagIrregularBTailScratchpadOutputHold = 1u << 3;
+    static constexpr uint32_t
+        kDescFlagIrregularFusedEdgesCompletionOptimized = 1u << 4;
+    static constexpr uint32_t
+        kDescFlagIrregularFusedRightEdgeCleanTiming = 1u << 5;
+    static constexpr uint32_t
+        kDescFlagIrregularNoWaitFusedRight = 1u << 6;
+    static constexpr uint32_t
+        kDescFlagIrregularNoWaitFusedBottom = 1u << 7;
+    static constexpr uint32_t
+        kDescFlagIrregularSingleFusedDescriptorCornerCollapse = 1u << 8;
+    static constexpr uint32_t
+        kDescFlagIrregularFinalCompletionChainAutopsy = 1u << 9;
+    static constexpr uint32_t
+        kDescFlagIrregularBoundaryOnlyHoldEarlyBodyWriteback = 1u << 10;
+    static constexpr uint32_t
+        kDescFlagIrregularStaticOutputTileClassifierBoundaryHold = 1u << 11;
+    static constexpr uint32_t
+        kDescFlagIrregularBoundaryWritebackCoalescing = 1u << 12;
+    static constexpr uint32_t
+        kDescFlagIrregularStreamingBodyWriteback = 1u << 13;
 
     struct GemmContext
     {
@@ -234,6 +270,14 @@ class MatrixFlowEngine : public ClockedObject
         Addr baseC = 0;
         Addr flagAddr = 0;
         uint32_t size = 0;
+        uint32_t mTotal = 0;
+        uint32_t nTotal = 0;
+        uint32_t kTotal = 0;
+        uint32_t lda = 0;
+        uint32_t ldb = 0;
+        uint32_t ldc = 0;
+        uint32_t flags = 0;
+        uint64_t completionValue = 0;
         uint32_t elemBytes = sizeof(uint32_t);
         uint32_t tileM = kMaxTileDim;
         uint32_t tileN = kMaxTileDim;
@@ -246,11 +290,279 @@ class MatrixFlowEngine : public ClockedObject
         uint32_t curTileK = 0;
     };
 
+    uint64_t subproblemStartDmaRead = 0;
+    uint64_t subproblemStartDmaWrite = 0;
+    uint64_t subproblemStartComputeCycles = 0;
+    bool batchSequenceActive = false;
+    Addr nextBatchDescAddr = 0;
+    uint32_t batchSubproblemIndex = 0;
+    bool irregularBTailScratchpadOutputHoldActive = false;
+    Addr irregularBatchRootBaseB = 0;
+    Addr irregularBatchRootBaseC = 0;
+    uint32_t irregularBatchRootLdb = 0;
+    uint32_t irregularBatchRootLdc = 0;
+    uint32_t irregularBatchBodyRows = 0;
+    uint32_t irregularBatchBodyCols = 0;
+    uint32_t currentSubproblemRowBase = 0;
+    uint32_t currentSubproblemColBase = 0;
+    bool tailScratchpadValid = false;
+    bool tailScratchpadLoading = false;
+    Addr tailScratchpadBaseB = 0;
+    uint32_t tailScratchpadRows = 0;
+    uint32_t tailScratchpadCols = 0;
+    uint32_t tailScratchpadLoadNextRow = 0;
+    uint32_t tailScratchpadLoadCompletedRows = 0;
+    Addr tailScratchpadReqAddr = 0;
+    Addr tailScratchpadReqBytes = 0;
+    Addr tailScratchpadRowBytes = 0;
+    Addr tailScratchpadReqOffset = 0;
+    bool tailScratchpadBounceActive = false;
+    bool tailScratchpadSingleShotActive = false;
+    Tick btailPreloadIssuedTick = 0;
+    Tick btailPreloadDoneTick = 0;
+    Tick atailPreloadIssuedTick = 0;
+    Tick atailPreloadDoneTick = 0;
+    Tick bodyFirstUsefulWorkIssuedTick = 0;
+    bool outputHoldActive = false;
+    bool outputHoldFinalWritebackInProgress = false;
+    Addr outputHoldBaseC = 0;
+    uint32_t outputHoldRows = 0;
+    uint32_t outputHoldCols = 0;
+    uint32_t outputHoldLdc = 0;
+    uint32_t outputHoldWritebackNextRow = 0;
+    uint32_t outputHoldWritebackCompletedRows = 0;
+    bool irregularFusedEdgesCompletionOptimizedActive = false;
+    bool aTailScratchpadValid = false;
+    bool aTailScratchpadLoading = false;
+    Addr aTailScratchpadBaseA = 0;
+    uint32_t aTailScratchpadRows = 0;
+    uint32_t aTailScratchpadCols = 0;
+    Addr aTailScratchpadReqAddr = 0;
+    Addr aTailScratchpadReqBytes = 0;
+    Addr aTailScratchpadRowBytes = 0;
+    Addr aTailScratchpadReqOffset = 0;
+    bool aTailScratchpadBounceActive = false;
+    struct PendingFusedRightTile
+    {
+        uint32_t tileI = 0;
+        uint32_t tileK = 0;
+        uint32_t curTileM = 0;
+        uint32_t curTileK = 0;
+        std::vector<uint32_t> tileA;
+    };
+    std::vector<PendingFusedRightTile> pendingFusedRightTiles;
+    struct PendingFusedBottomTile
+    {
+        uint32_t tileJ = 0;
+        uint32_t tileK = 0;
+        uint32_t curTileN = 0;
+        uint32_t curTileK = 0;
+        std::vector<uint32_t> tileB;
+    };
+    std::vector<PendingFusedBottomTile> pendingFusedBottomTiles;
+    bool finalCompletionChainAutopsyActive = false;
+    bool cornerCollapseActivatedThisBatch = false;
+    struct OutputWriteRegion
+    {
+        uint32_t rowStart = 0;
+        uint32_t colStart = 0;
+        uint32_t rows = 0;
+        uint32_t cols = 0;
+        uint32_t nextRow = 0;
+        uint32_t completedRows = 0;
+        uint32_t interiorCols = 0;
+        bool boundary = false;
+        bool includesRightBoundary = false;
+        bool earlyBottomBoundary = false;
+        bool bulkContiguous = false;
+        Tick beginTick = 0;
+        Tick issueTick = 0;
+    };
+    enum class OutputTileClass : uint8_t
+    {
+        Interior = 0,
+        RightBoundary,
+        BottomBoundary,
+        CornerBoundary,
+    };
+    bool staticOutputTileClassifierValid = false;
+    bool staticOutputTileBoundaryStatsCounted = false;
+    bool coalescedRightBoundaryCovered = false;
+    bool coalescedBottomBoundaryCovered = false;
+    uint32_t staticOutputTileDim = 0;
+    uint32_t staticOutputTileRows = 0;
+    uint32_t staticOutputTileCols = 0;
+    uint32_t staticOutputMainRows = 0;
+    uint32_t staticOutputMainCols = 0;
+    uint32_t staticInteriorTileCount = 0;
+    uint32_t staticRightBoundaryTileCount = 0;
+    uint32_t staticBottomBoundaryTileCount = 0;
+    uint32_t staticCornerBoundaryTileCount = 0;
+    Tick staticOutputTileClassifierBeginTick = 0;
+    Tick staticOutputTileClassifierEndTick = 0;
+    std::vector<OutputTileClass> staticOutputTileClasses;
+    std::deque<OutputWriteRegion> earlyBodyWritebackQueue;
+    OutputWriteRegion earlyBodyWritebackActiveRegion;
+    bool earlyBodyWritebackActive = false;
+    bool boundaryOnlyFinalWritebackRequested = false;
+    bool boundaryOnlyFinalWritebackActive = false;
+    std::vector<OutputWriteRegion> boundaryWritebackRequests;
+    uint32_t boundaryWritebackNextReq = 0;
+    uint32_t boundaryWritebackCompletedReqs = 0;
+    Tick bodyInteriorWritebackBeginTick = 0;
+    Tick bodyInteriorWritebackIssuedTick = 0;
+    Tick bodyInteriorWritebackDrainedTick = 0;
+    Tick boundaryOutputWritebackBeginTick = 0;
+    Tick boundaryOutputWritebackIssuedTick = 0;
+    Tick boundaryOutputWritebackDrainedTick = 0;
+    Tick completionVisibleWriteStartTick = 0;
+    Tick finalWritebackBeginTick = 0;
+    Tick finalWritebackIssuedTick = 0;
+    Tick finalWritebackAllResponsesDrainedTick = 0;
+    Tick completionEligibilitySatisfiedTick = 0;
+    Tick deviceCompletionFlagWriteBeginTick = 0;
+    Tick deviceCompletionFlagWriteEndTick = 0;
+    Tick deviceCompletionFullyVisibleTick = 0;
+    static constexpr uint32_t kResidualAutopsyMaxBatchSteps = 4;
+    Tick deviceWindowBeginTick = 0;
+    Tick deviceWindowEndTick = 0;
+    Tick finalUsefulWorkDoneTick = 0;
+    std::array<Tick, kResidualAutopsyMaxBatchSteps> batchStepDescFetchedTicks{};
+    std::array<Tick, kResidualAutopsyMaxBatchSteps> batchStepDescDecodedTicks{};
+    std::array<Tick, kResidualAutopsyMaxBatchSteps> batchStepRunnableTicks{};
+    std::array<Tick, kResidualAutopsyMaxBatchSteps> batchStepFirstWorkIssuedTicks{};
+    std::array<Tick, kResidualAutopsyMaxBatchSteps> batchStepLastWorkCompletedTicks{};
+    std::array<Tick, kResidualAutopsyMaxBatchSteps> batchStepCompletionCommittedTicks{};
+    std::array<Tick, kResidualAutopsyMaxBatchSteps> batchTransitionBeginTicks{};
+    std::array<Tick, kResidualAutopsyMaxBatchSteps> batchTransitionEndTicks{};
+    std::array<Tick, kResidualAutopsyMaxBatchSteps> tailDependencyWaitBeginTicks{};
+    std::array<Tick, kResidualAutopsyMaxBatchSteps> tailDependencyWaitEndTicks{};
+
     struct EngineStats : public statistics::Group
     {
         statistics::Scalar totalDmaBytesRead;
         statistics::Scalar totalDmaBytesWritten;
         statistics::Scalar totalComputeCycles;
+        statistics::Scalar peeledBatchLaunchCount;
+        statistics::Scalar peeledBatchSubproblemCount;
+        statistics::Scalar peeledBatchSingleDoorbellCount;
+        statistics::Scalar peeledBatchCompletionCount;
+        statistics::Scalar peeledBatchGuestWaitCount;
+        statistics::Scalar peeledBatchInternalStepCount;
+        statistics::Scalar adaptivePollBackoffCount;
+        statistics::Scalar completionVisibleWriteCount;
+        statistics::Scalar completionFinalVisibleLatency;
+        statistics::Scalar batchInternalCompletionCount;
+        statistics::Scalar batchGuestVisibleCompletionCount;
+        statistics::Scalar residualDeviceOverheadCycles;
+        statistics::Scalar descriptorDecodeOverheadCycles;
+        statistics::Scalar batchTransitionGapCycles;
+        statistics::Scalar tailDependencyWaitCycles;
+        statistics::Scalar dmaDrainWaitCycles;
+        statistics::Scalar deviceFinalCompletionOverheadCycles;
+        statistics::Scalar finalCompletionCycles;
+        statistics::Scalar finalWritebackDrainCycles;
+        statistics::Scalar writebackResponseDrainCycles;
+        statistics::Scalar completionEligibilityCycles;
+        statistics::Scalar completionTokenWriteCycles;
+        statistics::Scalar completionVisibilityCycles;
+        statistics::Scalar bodyPostGapCycles;
+        statistics::Scalar rightEdgeNoOpGapCycles;
+        statistics::Scalar bottomEdgePreStartGapCycles;
+        statistics::Scalar cornerFinalGapCycles;
+        statistics::Scalar batchStepCount;
+        statistics::Scalar batchNoOpStepCount;
+        statistics::Scalar batchTransitionCount;
+        statistics::Scalar peeledLegacyLaunchCount;
+        statistics::Scalar peeledLegacyDoorbellCount;
+        statistics::Scalar peeledLegacyCompletionWaitCount;
+        statistics::Scalar tailScratchpadLoadCount;
+        statistics::Scalar tailScratchpadBytesLoaded;
+        statistics::Scalar tailScratchpadOccupancyPeak;
+        statistics::Scalar tailScratchpadHitCount;
+        statistics::Scalar tailScratchpadMissCount;
+        statistics::Scalar tailScratchpadReuseCount;
+        statistics::Scalar tailScratchpadCapacityBytes;
+        statistics::Scalar outputHoldStoreCount;
+        statistics::Scalar outputHoldBytesStored;
+        statistics::Scalar outputHoldOccupancyPeak;
+        statistics::Scalar outputHoldReadForEpilogueCount;
+        statistics::Scalar outputHoldFinalWritebackCount;
+        statistics::Scalar outputHoldBytesWrittenBack;
+        statistics::Scalar bodyInteriorWritebackBytes;
+        statistics::Scalar boundaryWritebackBytes;
+        statistics::Scalar bodyInteriorWritebackDrainCycles;
+        statistics::Scalar boundaryWritebackDrainCycles;
+        statistics::Scalar earlyBodyWritebackCount;
+        statistics::Scalar boundaryOnlyHoldCount;
+        statistics::Scalar bodyInteriorResponsesDrainedBeforeFinalCompletionCount;
+        statistics::Scalar boundaryOutstandingWriteRespAtCompletionGate;
+        statistics::Scalar interiorTileCount;
+        statistics::Scalar rightBoundaryTileCount;
+        statistics::Scalar bottomBoundaryTileCount;
+        statistics::Scalar cornerBoundaryTileCount;
+        statistics::Scalar interiorTileDirectWritebackCount;
+        statistics::Scalar boundaryTileHoldCount;
+        statistics::Scalar boundaryTileWritebackCount;
+        statistics::Scalar tileClassifierSetupCycles;
+        statistics::Scalar tileClassifierHotPathChecks;
+        statistics::Scalar boundaryWritebackCoalescingCount;
+        statistics::Scalar boundaryRightColumnPiggybackCount;
+        statistics::Scalar boundaryRightColumnPiggybackBytes;
+        statistics::Scalar boundaryBottomEarlyWritebackCount;
+        statistics::Scalar boundaryBottomEarlyWritebackBytes;
+        statistics::Scalar finalBoundaryWritebackRequestCount;
+        statistics::Scalar streamingBodyWritebackCount;
+        statistics::Scalar streamingBodyWritebackBulkRequestCount;
+        statistics::Scalar streamingBodyWritebackBytes;
+        statistics::Scalar tailPackOnceCount;
+        statistics::Scalar tailPackBytes;
+        statistics::Scalar rightEdgeServedFromTailScratchpadCount;
+        statistics::Scalar rightEdgeDescriptorNoOpCount;
+        statistics::Scalar rightEdgeServedFromAReuseCount;
+        statistics::Scalar rightEdgeAReuseBytesSaved;
+        statistics::Scalar rightEdgeActiveTimeCycles;
+        statistics::Scalar rightEdgeDmaReadBytes;
+        statistics::Scalar rightEdgeComputeCycles;
+        statistics::Scalar bodyWaitForBTailCycles;
+        statistics::Scalar bodyStartBlockedByBTailCount;
+        statistics::Scalar bodyStartedWithoutBTailCount;
+        statistics::Scalar btailPreloadCount;
+        statistics::Scalar btailPreloadLatencyCycles;
+        statistics::Scalar btailPreloadLeadCycles;
+        statistics::Scalar btailPreloadOverlapCycles;
+        statistics::Scalar fusedRightPendingCount;
+        statistics::Scalar fusedRightActivatedCount;
+        statistics::Scalar fusedRightActivationDelayCycles;
+        statistics::Scalar bodyWaitForATailCycles;
+        statistics::Scalar bodyStartBlockedByATailCount;
+        statistics::Scalar bodyStartedWithoutATailCount;
+        statistics::Scalar atailPreloadCount;
+        statistics::Scalar atailPreloadLatencyCycles;
+        statistics::Scalar atailPreloadLeadCycles;
+        statistics::Scalar atailPreloadOverlapCycles;
+        statistics::Scalar fusedBottomPendingCount;
+        statistics::Scalar fusedBottomActivatedCount;
+        statistics::Scalar fusedBottomActivationDelayCycles;
+        statistics::Scalar bottomEdgeDescriptorNoOpCount;
+        statistics::Scalar cornerServedFromTailScratchpadCount;
+        statistics::Scalar bottomEdgeServedFromBReuseCount;
+        statistics::Scalar bottomEdgeBReuseBytesSaved;
+        statistics::Scalar bottomEdgeActiveTimeCycles;
+        statistics::Scalar bottomEdgeDmaReadBytes;
+        statistics::Scalar bottomEdgeComputeCycles;
+        statistics::Scalar singleFusedIrregularDescriptorCount;
+        statistics::Scalar legacyBatchSubproblemCount;
+        statistics::Scalar fusedIrregularStateStepCount;
+        statistics::Scalar fusedStateTransitionOverheadCycles;
+        statistics::Scalar cornerIndependentActiveCycles;
+        statistics::Scalar cornerCollapsedActiveCycles;
+        statistics::Scalar cornerIndependentExecutionCount;
+        statistics::Scalar cornerCollapseCount;
+        statistics::Scalar cornerServedFromTailOperandsCount;
+        statistics::Scalar epilogueMergeCount;
+        statistics::Scalar epilogueCycles;
+        statistics::Scalar singleWritebackCount;
         statistics::Scalar nextPrefetchIssueCount;
         statistics::Scalar nextKPrefetchIssueCount;
         statistics::Scalar nextOutputPrefetchIssueCount;
@@ -555,6 +867,9 @@ class MatrixFlowEngine : public ClockedObject
     const bool carryOverInheritInflight;
     const uint32_t holeFillLeadRowsConfig;
     const uint32_t writeCOverlapBIssueBudgetRowsConfig;
+    const uint32_t bodyInteriorWritebackStripeRowsConfig;
+    const uint32_t bodyInteriorWritebackMaxOutstandingStripesConfig;
+    const uint32_t boundaryRightWritebackBytesConfig;
     const uint32_t vipBRowsCapacityConfig;
     const uint32_t mhotBRowsCapacityConfig;
     const uint32_t coverageShadowRowsCapacityConfig;
@@ -585,6 +900,11 @@ class MatrixFlowEngine : public ClockedObject
     std::vector<uint8_t> nextFetchBBounceBuffer;
     std::vector<uint8_t> nextOutputFetchBBounceBuffer;
     std::vector<uint8_t> coverageGatherBBounceBuffer;
+    std::vector<uint8_t> tailScratchpadBuffer;
+    std::vector<uint8_t> tailScratchpadBounceBuffer;
+    std::vector<uint8_t> aTailScratchpadBuffer;
+    std::vector<uint8_t> aTailScratchpadBounceBuffer;
+    std::vector<uint8_t> outputHoldBuffer;
     std::vector<Addr> fetchABounceReqAddr;
     std::vector<Addr> fetchABounceReqBytes;
     std::vector<Addr> fetchABounceRowBytes;
@@ -668,7 +988,9 @@ class MatrixFlowEngine : public ClockedObject
     Addr pendingMatrixB;
     Addr pendingResult;
     Addr pendingFlagAddr;
-    int pendingSize;
+    uint32_t pendingM;
+    uint32_t pendingN;
+    uint32_t pendingK;
     Descriptor pendingDesc;
     uint64_t completionFlagValue;
     uint64_t hierarchicalDebugComputeDeferCount = 0;
@@ -783,11 +1105,16 @@ class MatrixFlowEngine : public ClockedObject
     EventFunctionWrapper fetchDescCompleteEvent;
     EventFunctionWrapper computeDoneEvent;
     EventFunctionWrapper writeFlagCompleteEvent;
+    EventFunctionWrapper tailScratchpadLoadCompleteEvent;
+    EventFunctionWrapper aTailScratchpadLoadCompleteEvent;
+    EventFunctionWrapper heldOutputWriteCompleteEvent;
 
     /** One completion event per row slot (avoids "Event already scheduled"). */
     std::vector<EventFunctionWrapper> fetchARowEvents;
     std::vector<EventFunctionWrapper> fetchBRowEvents;
     std::vector<EventFunctionWrapper> writeCRowEvents;
+    std::vector<EventFunctionWrapper> earlyBodyWritebackRowEvents;
+    std::vector<EventFunctionWrapper> boundaryOutputWriteEvents;
     std::vector<EventFunctionWrapper> nextFetchARowEvents;
     std::vector<EventFunctionWrapper> nextFetchBRowEvents;
     std::vector<EventFunctionWrapper> nextOutputFetchBRowEvents;
@@ -799,7 +1126,80 @@ class MatrixFlowEngine : public ClockedObject
                                 uint32_t tileK) const;
     std::tuple<Addr, Addr, Addr> planReadRequest(
         Addr rowAddr, Addr rowBytes) const;
+    Addr matrixAAddr(const GemmContext &gctx, uint32_t row,
+                     uint32_t col) const;
+    Addr matrixBAddr(const GemmContext &gctx, uint32_t row,
+                     uint32_t col) const;
+    Addr matrixCAddr(const GemmContext &gctx, uint32_t row,
+                     uint32_t col) const;
     void resetContext();
+    void startDescriptorInternal(Addr descriptorAddr, bool batchStep);
+    void resetResidualAutopsyState();
+    void markBatchStepFirstWorkIssued();
+    void markTailDependencyWaitBegin();
+    void markTailDependencyWaitEnd();
+    void markBatchStepLastWorkCompleted(const char *reason);
+    void accumulateResidualAutopsyAtFinish(bool writeCompletion);
+    bool irregularBTailScratchpadOutputHoldMode() const;
+    bool irregularFusedEdgesCompletionOptimizedMode() const;
+    bool irregularFusedRightEdgeCleanTimingMode() const;
+    bool irregularNoWaitFusedRightMode() const;
+    bool irregularNoWaitFusedBottomMode() const;
+    bool irregularSingleFusedDescriptorCornerCollapseMode() const;
+    bool irregularFinalCompletionChainAutopsyMode() const;
+    bool irregularBoundaryOnlyHoldEarlyBodyWritebackMode() const;
+    bool irregularStaticOutputTileClassifierBoundaryHoldMode() const;
+    bool irregularBoundaryWritebackCoalescingMode() const;
+    bool irregularStreamingBodyWritebackMode() const;
+    bool currentSubproblemUsesTailScratchpad() const;
+    bool currentSubproblemUsesOutputHold() const;
+    bool currentSubproblemUsesFusedEdges() const;
+    uint32_t irregularTailStartRow() const;
+    uint32_t irregularTailStartCol() const;
+    uint32_t irregularTailRows() const;
+    uint32_t irregularTailCols() const;
+    void initIrregularBatchSharedState();
+    void issueTailScratchpadLoad();
+    void issueNextTailScratchpadRow();
+    void onTailScratchpadLoadComplete();
+    void issueATailScratchpadLoad();
+    void onATailScratchpadLoadComplete();
+    void maybeStartIrregularPreludeLoads();
+    bool currentSubproblemIsFusedNoOp() const;
+    void enqueuePendingFusedRightTile();
+    void accumulateFusedRightEdgeFromBufferedTile(
+        const PendingFusedRightTile &tile);
+    void processPendingFusedRightTiles();
+    void enqueuePendingFusedBottomTile();
+    void accumulateFusedBottomEdgeFromBufferedTile(
+        const PendingFusedBottomTile &tile);
+    void processPendingFusedBottomTiles();
+    void accumulateFusedRightEdgeFromCurrentATile();
+    void accumulateFusedBottomEdgeFromCurrentBTile();
+    void accumulateFusedCornerFromCurrentTiles();
+    void onHeldOutputWriteComplete();
+    const char *outputTileClassName(OutputTileClass tileClass) const;
+    void precomputeStaticOutputTileClassification();
+    OutputTileClass outputTileClassForRegion(uint32_t rowStart,
+                                             uint32_t colStart,
+                                             uint32_t rows,
+                                             uint32_t cols);
+    uint32_t earlyBodyWritebackRowWindow(
+        const OutputWriteRegion &region) const;
+    bool currentTileIsInteriorOutputForEarlyWriteback();
+    void maybeEnqueueEarlyBottomBoundaryWritebackForCurrentTile();
+    void enqueueEarlyBodyInteriorWritebackForCurrentTile();
+    void tryStartNextEarlyBodyInteriorWriteback();
+    void trySendMoreEarlyBodyInteriorWritebackRows();
+    void onEarlyBodyInteriorWritebackRowComplete(uint32_t rowIdx);
+    void issueBoundaryOnlyFinalWriteback();
+    void tryStartBoundaryOutputWriteback();
+    void trySendMoreBoundaryOutputWrites();
+    void onBoundaryOutputWriteComplete(uint32_t eventIdx);
+    void populateBTileFromTailScratchpad();
+    void storeCurrentTileToOutputHold();
+    void issueWriteHeldOutputBatch();
+    void trySendMoreHeldOutput();
     void issueFetchDescriptor();
     void prepareOutputTile();
     void issueFetchATile();
@@ -823,12 +1223,16 @@ class MatrixFlowEngine : public ClockedObject
     void onNextOutputFetchBRowComplete(uint32_t rowIdx);
     void onCoverageGatherBRowComplete(uint32_t rowIdx);
     void onWriteFlagComplete();
+    void finishCurrentSubproblem(bool writeCompletion);
     void launchComputeTile();
     void accumulateCurrentTile();
     void advanceTile();
     void processComputeDone();
     bool hasNextKTile() const;
     bool hasNextOutputTile() const;
+    uint32_t futureITileReuseCount(const GemmContext &gctx) const;
+    uint32_t futureJTileReuseCount(const GemmContext &gctx) const;
+    uint32_t tileStepsToNextUse(const GemmContext &gctx) const;
     GemmContext buildNextKContext() const;
     GemmContext buildNextOutputContext() const;
     void maybePrefetchNextTile();
@@ -1075,9 +1479,6 @@ class MatrixFlowEngine : public ClockedObject
                                           const uint8_t *src,
                                           CoverageShadowInsertSource source);
     uint32_t mhotCoverageBlindspotQuotaRows() const;
-    uint32_t futureITileReuseCount(const GemmContext &gctx) const;
-    uint32_t futureJTileReuseCount(const GemmContext &gctx) const;
-    uint32_t tileStepsToNextUse(const GemmContext &gctx) const;
     bool isSmartCoverageTargetForContext(const GemmContext &gctx,
                                          uint32_t rowIdx) const;
     bool isSmartGapTargetForContext(const GemmContext &gctx,

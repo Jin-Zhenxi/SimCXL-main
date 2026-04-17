@@ -35,7 +35,9 @@ class CXLMemCtrl(PciDevice):
         MatrixFlowEngine(
             mac_array_size=16,
             compute_latency_per_op=1,
-            min_read_request_bytes=64,
+            min_read_request_bytes=int(
+                os.getenv("MATRIXFLOW_MIN_READ_REQUEST_BYTES", "64")
+            ),
             next_prefetch_mode=os.getenv(
                 "MATRIXFLOW_NEXT_PREFETCH_MODE", "b_only"
             ),
@@ -59,6 +61,17 @@ class CXLMemCtrl(PciDevice):
             ),
             writec_overlap_b_issue_budget_rows=int(
                 os.getenv("MATRIXFLOW_WRITEC_OVERLAP_B_ISSUE_BUDGET_ROWS", "0")
+            ),
+            body_interior_writeback_stripe_rows=int(
+                os.getenv(
+                    "MATRIXFLOW_BODY_INTERIOR_WRITEBACK_STRIPE_ROWS", "0"
+                )
+            ),
+            body_interior_writeback_max_outstanding_stripes=int(
+                os.getenv(
+                    "MATRIXFLOW_BODY_INTERIOR_WRITEBACK_MAX_OUTSTANDING_STRIPES",
+                    "0",
+                )
             ),
             vip_b_rows_capacity=int(
                 os.getenv("MATRIXFLOW_VIP_B_ROWS_CAPACITY", "0")

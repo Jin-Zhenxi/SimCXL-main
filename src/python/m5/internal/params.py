@@ -36,6 +36,7 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import importlib
 import inspect
 
 try:
@@ -48,6 +49,18 @@ except ImportError:
     in_gem5 = False
 
 if in_gem5:
+    for forced_module in (
+        "_m5.param_BaseKvmCPU",
+        "_m5.param_X86KvmCPU",
+    ):
+        try:
+            forced = importlib.import_module(forced_module)
+        except ImportError:
+            continue
+        for name in dir(forced):
+            if not name.startswith("_"):
+                globals()[name] = getattr(forced, name)
+
     for name, module in inspect.getmembers(_m5):
         if name.startswith("param_") or name.startswith("enum_"):
             exec(f"from _m5.{name} import *")

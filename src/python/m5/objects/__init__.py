@@ -35,6 +35,11 @@ allow_source_fallback = (
     os.environ.get("M5_SOURCE_OBJECTS_FALLBACK", "0") == "1"
 )
 
+try:
+    import m5.internal.params as _m5_internal_params
+except Exception:
+    _m5_internal_params = None
+
 
 def _fallback_roots():
     env_roots = os.environ.get("M5_SOURCE_OBJECTS_FALLBACK_ROOTS", "")
@@ -47,22 +52,25 @@ def _fallback_roots():
         if roots:
             return roots
 
+    module_file = globals().get("__file__") or getattr(
+        __spec__, "origin", None
+    )
+    if not module_file:
+        module_file = os.path.join(
+            os.getcwd(), "src", "python", "m5", "objects", "__init__.py"
+        )
+
     return [
         os.path.abspath(
             os.path.join(
-                os.path.dirname(__file__), "..", "..", "..", "..", "src"
+                os.path.dirname(module_file), "..", "..", "..", "..", "src"
             )
         )
     ]
 
 
-if loader_state:
-    for module in loader_state:
-        if module.startswith("m5.objects."):
-            exec(f"from {module} import *")
-elif allow_source_fallback:
+def _build_source_fallback_map():
     fallback_modules = {}
-    preload_modules = {}
     for scan_root in _fallback_roots():
         for root, _, files in os.walk(scan_root):
             if os.path.abspath(root).startswith(
@@ -78,16 +86,10 @@ elif allow_source_fallback:
                 path = os.path.join(root, entry)
                 full_module = f"m5.objects.{mod_name}"
                 fallback_modules.setdefault(full_module, path)
-                try:
-                    with open(path, encoding="utf-8") as src_file:
-                        src = src_file.read()
-                except OSError:
-                    continue
-                is_simobject_like = "cxx_header" in src or "cxx_class" in src
-                is_enum_like = "enum_name" in src and "class " in src
-                if is_simobject_like or is_enum_like:
-                    preload_modules.setdefault(full_module, path)
+    return fallback_modules
 
+
+def _install_source_fallback(fallback_modules):
     class _ObjectsSourceFallbackFinder(importlib.abc.MetaPathFinder):
         def find_spec(self, fullname, path=None, target=None):
             file_path = fallback_modules.get(fullname)
@@ -101,17 +103,60 @@ elif allow_source_fallback:
     ):
         sys.meta_path.insert(0, _ObjectsSourceFallbackFinder())
 
-    imported = set()
-    progress = True
-    while progress:
-        progress = False
-        for full_module in sorted(preload_modules):
-            if full_module in imported or full_module in sys.modules:
-                continue
-            try:
-                module = importlib.import_module(full_module)
-            except Exception:
-                continue
-            imported.add(full_module)
-            exec(f"from {full_module} import *")
-            progress = True
+
+def _module_has_backing_params(module_name, module_obj):
+    if _m5_internal_params is None:
+        return True
+
+    module_basename = module_name.rsplit(".", 1)[-1]
+    simobject_cls = getattr(module_obj, module_basename, None)
+    if simobject_cls is None:
+        return True
+
+    params_name = f"{module_basename}Params"
+    return hasattr(_m5_internal_params, params_name)
+
+
+def _export_module_symbols(module_obj):
+    export_names = getattr(module_obj, "__all__", None)
+    if export_names is None:
+        export_names = [
+            name for name in module_obj.__dict__ if not name.startswith("_")
+        ]
+    for name in export_names:
+        globals()[name] = getattr(module_obj, name)
+
+
+missing_modules = set()
+
+if loader_state:
+    for module in loader_state:
+        if not module.startswith("m5.objects."):
+            continue
+        try:
+            module_obj = importlib.import_module(module)
+        except ModuleNotFoundError:
+            missing_modules.add(module)
+            continue
+        except Exception:
+            continue
+
+        if not _module_has_backing_params(module, module_obj):
+            continue
+
+        _export_module_symbols(module_obj)
+
+if allow_source_fallback and (missing_modules or not loader_state):
+    fallback_modules = _build_source_fallback_map()
+    _install_source_fallback(fallback_modules)
+
+    for full_module in sorted(missing_modules):
+        try:
+            module_obj = importlib.import_module(full_module)
+        except Exception:
+            continue
+
+        if not _module_has_backing_params(full_module, module_obj):
+            continue
+
+        _export_module_symbols(module_obj)

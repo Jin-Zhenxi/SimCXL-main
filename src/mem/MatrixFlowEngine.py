@@ -51,6 +51,18 @@ class MatrixFlowEngine(ClockedObject):
         0,
         "Max new B rows that WriteC overlap may issue while keeping continuation alive (0 means disabled by default)",
     )
+    body_interior_writeback_stripe_rows = Param.Unsigned(
+        0,
+        "Stripe row window for early body-interior writeback scheduling (0 means legacy unlimited window)",
+    )
+    body_interior_writeback_max_outstanding_stripes = Param.Unsigned(
+        0,
+        "Max outstanding body-interior writeback stripes allowed in the scheduler window (0 means legacy unlimited window)",
+    )
+    boundary_right_writeback_bytes = Param.Unsigned(
+        4,
+        "Right-boundary final writeback request width in bytes (default preserves legacy 4B single-element writeback)",
+    )
     vip_b_rows_capacity = Param.Unsigned(
         0,
         "Capacity of the guaranteed-local VIP pool measured in row slots (0 means disabled)",

@@ -35,7 +35,7 @@ CSV_FILE = os.path.join(OUTPUT_DIR, "roofline_data.csv")
 RAW_TXT_FILE = os.path.join(OUTPUT_DIR, "summary_raw.txt")
 DEFAULT_PHASE2_MODE = "staged_block"
 DEFAULT_STAGED_BLOCK_BYTES = 1024
-DEFAULT_MIN_READ_REQUEST_BYTES = 64
+DEFAULT_MIN_READ_REQUEST_BYTES = 256
 MAX_INVALID_RUN_RETRIES = 3
 FORCE_RERUN = True
 RUN_ONLY_PRESET_NAMES = {"ViT-Large-like"}
@@ -1025,13 +1025,30 @@ def extract_metrics(stats_file, log_file):
     if match_cycles:
         metrics["computeCycles"] = int(match_cycles.group(1))
 
-    # 若最后一块无 computeCycles，尝试从 terminal log 抓取（DPRINTF 输出）
-    if metrics["computeCycles"] == 0 and os.path.exists(log_file):
-        with open(log_file) as f:
-            log_text = f.read()
-            match_cycles = re.search(r"computeCycles=(\d+)", log_text)
-            if match_cycles:
-                metrics["computeCycles"] = int(match_cycles.group(1))
+    if os.path.exists(log_file):
+        with open(log_file, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if metrics["dmaRead"] == 0:
+                    match_read = re.search(r"dmaRead=(\d+)", line)
+                    if match_read:
+                        metrics["dmaRead"] = int(match_read.group(1))
+
+                if metrics["dmaWrite"] == 0:
+                    match_write = re.search(r"dmaWrite=(\d+)", line)
+                    if match_write:
+                        metrics["dmaWrite"] = int(match_write.group(1))
+
+                if metrics["computeCycles"] == 0:
+                    match_cycles = re.search(r"computeCycles=(\d+)", line)
+                    if match_cycles:
+                        metrics["computeCycles"] = int(match_cycles.group(1))
+
+                if (
+                    metrics["dmaRead"] > 0
+                    and metrics["dmaWrite"] > 0
+                    and metrics["computeCycles"] > 0
+                ):
+                    break
 
     return metrics
 
@@ -1646,13 +1663,13 @@ def compute_request_formation(preset):
     def add_packetized(req_bytes):
         remaining = req_bytes
         while remaining > 0:
-            chunk = min(64, remaining)
+            chunk = min(DEFAULT_MIN_READ_REQUEST_BYTES, remaining)
             packetized[chunk] += 1
             remaining -= chunk
 
     # One GEMM only; run_sweep separately reports per-gemm and total counts.
-    raw[40] += 1  # descriptor read
-    add_packetized(40)
+    raw[48] += 1  # descriptor read
+    add_packetized(48)
     raw[8] += 1  # completion flag write
     add_packetized(8)
 
@@ -1705,8 +1722,46 @@ def compute_request_formation(preset):
 
 
 def extract_gemm_active_time(log_file):
-    phase = extract_phase_timings(log_file)
-    return (phase["phase1_ms"] + phase["phase3_ms"]) / 1.0e3
+    if not os.path.exists(log_file):
+        return 0.0
+
+    start_ticks = []
+    completion_flag_ticks = []
+    subproblem_done_ticks = []
+    with open(log_file, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            match = re.search(r"^(\d+): .*startMatrixCompute:", line)
+            if match:
+                start_ticks.append(int(match.group(1)))
+                continue
+
+            match = re.search(
+                r"^(\d+): .*MatrixFlow completion flag written:", line
+            )
+            if match:
+                completion_flag_ticks.append(int(match.group(1)))
+                continue
+
+            match = re.search(r"^(\d+): .*MatrixFlow subproblem done:", line)
+            if match:
+                subproblem_done_ticks.append(int(match.group(1)))
+
+    done_ticks = (
+        completion_flag_ticks
+        if completion_flag_ticks
+        else subproblem_done_ticks
+    )
+
+    pair_count = min(len(start_ticks), len(done_ticks))
+    if pair_count == 0:
+        return 0.0
+
+    total_ticks = 0
+    for idx in range(pair_count):
+        if done_ticks[idx] > start_ticks[idx]:
+            total_ticks += done_ticks[idx] - start_ticks[idx]
+
+    return total_ticks / 1.0e12
 
 
 def extract_phase_timings(serial_log_file):
@@ -2060,7 +2115,7 @@ def main():
                 attention_gemm_flops + mlp_gemm_flops + non_gemm_flops
             )
             roi_latency_s = metrics["simSeconds"]
-            gemm_active_s = extract_gemm_active_time(serial_log)
+            gemm_active_s = extract_gemm_active_time(log_file)
             dma_bytes = metrics["dmaRead"] + metrics["dmaWrite"]
             total_movement_bytes = (
                 dma_bytes + phase["total_proxy_movement_bytes"]
