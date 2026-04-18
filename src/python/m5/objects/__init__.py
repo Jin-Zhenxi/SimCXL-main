@@ -160,3 +160,31 @@ if allow_source_fallback and (missing_modules or not loader_state):
             continue
 
         _export_module_symbols(module_obj)
+
+
+def _ensure_required_source_objects():
+    required_modules = (
+        "m5.objects.RedirectPath",
+        "m5.objects.ThermalModel",
+    )
+    installed_fallback = False
+
+    for full_module in required_modules:
+        class_name = full_module.rsplit(".", 1)[-1]
+        if class_name in globals():
+            continue
+
+        if not installed_fallback:
+            fallback_modules = _build_source_fallback_map()
+            _install_source_fallback(fallback_modules)
+            installed_fallback = True
+
+        try:
+            module_obj = importlib.import_module(full_module)
+        except Exception:
+            continue
+
+        _export_module_symbols(module_obj)
+
+
+_ensure_required_source_objects()

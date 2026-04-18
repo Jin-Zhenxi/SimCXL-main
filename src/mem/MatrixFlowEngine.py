@@ -16,6 +16,10 @@ class MatrixFlowEngine(ClockedObject):
     compute_latency_per_op = Param.Cycles(
         1, "Compute latency in cycles per operation chunk"
     )
+    dma_chunk_size = Param.Unsigned(
+        64,
+        "Deprecated compatibility shim for older embedded CXLDevice.py builds; unused by the current MatrixFlow engine",
+    )
     min_read_request_bytes = Param.Unsigned(
         64, "Minimum DMA read request granularity for MatrixFlow edge rows"
     )

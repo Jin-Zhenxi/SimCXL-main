@@ -71,7 +71,15 @@ def get_prefetch_cfg(label: str) -> dict[str, object]:
 def build_matrixflow_env(
     base_env: dict[str, str], cfg: dict[str, object], preset_name: str
 ) -> dict[str, str]:
-    rows_b = cfg.get("rows_b_by_preset", {}).get(preset_name, cfg["rows_b"])
+    rows_b_by_preset = cfg.get("rows_b_by_preset", {})
+    rows_b = rows_b_by_preset.get(preset_name)
+    if rows_b is None and preset_name == "ViT-Huge-like":
+        # Huge uses the same seq_len/tail geometry as Large on this proxy, so
+        # keep the B prefetch budget aligned instead of falling back to the
+        # much smaller default rows_b.
+        rows_b = rows_b_by_preset.get("ViT-Large-like")
+    if rows_b is None:
+        rows_b = cfg["rows_b"]
     env = base_env.copy()
     env["MATRIXFLOW_NEXT_PREFETCH_MODE"] = str(cfg["mode"])
     env["MATRIXFLOW_NEXT_PREFETCH_TRIGGER"] = str(cfg["trigger"])

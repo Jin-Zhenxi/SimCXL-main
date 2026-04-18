@@ -65,6 +65,7 @@ class Bridge(ClockedObject):
         [AllMemory], "Address ranges to pass through the bridge"
     )
 
+
 class CXLBridge(ClockedObject):
     type = "CXLBridge"
     cxx_header = "mem/cxl_bridge.hh"
@@ -83,10 +84,33 @@ class CXLBridge(ClockedObject):
         cpu_side_port, "`slave` is now called `cpu_side_port`"
     )
 
-    req_fifo_depth= Param.Unsigned(48, "The number of requests to buffer")
+    req_fifo_depth = Param.Unsigned(48, "The number of requests to buffer")
     resp_fifo_depth = Param.Unsigned(48, "The number of responses to buffer")
+    small_pkt_size = Param.Unsigned(
+        64,
+        "Deprecated compatibility shim for older bridge configs",
+    )
+    small_pkt_overhead_pct = Param.Unsigned(
+        0,
+        "Deprecated compatibility shim for older bridge configs",
+    )
+    optimal_pkt_size = Param.Unsigned(
+        256,
+        "Deprecated compatibility shim for older configs that still pass "
+        "`optimal_pkt_size` to CXLBridge",
+    )
+    large_pkt_size = Param.Unsigned(
+        4096,
+        "Deprecated compatibility shim for older bridge configs",
+    )
+    large_pkt_overhead_pct = Param.Unsigned(
+        36,
+        "Deprecated compatibility shim for older bridge configs",
+    )
     bridge_lat = Param.Latency("50ns", "The latency of this bridge")
-    proto_proc_lat = Param.Latency("14ns", "Conversion latency of cxl protocol in bridge")
+    proto_proc_lat = Param.Latency(
+        "14ns", "Conversion latency of cxl protocol in bridge"
+    )
     ranges = VectorParam.AddrRange(
         [AllMemory], "Address ranges to pass through the bridge"
     )

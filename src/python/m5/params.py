@@ -187,7 +187,13 @@ class ParamDesc:
         if attr == "ptype":
             from . import SimObject
 
-            ptype = SimObject.allClasses[self.ptype_str]
+            ptype = SimObject.allClasses.get(self.ptype_str)
+            if ptype is None:
+                try:
+                    importlib.import_module(f"m5.objects.{self.ptype_str}")
+                except Exception:
+                    pass
+                ptype = SimObject.allClasses[self.ptype_str]
             assert isSimObjectClass(ptype)
             self.ptype = ptype
             return ptype
@@ -2530,3 +2536,4 @@ __all__ = [
     "DeprecatedParam",
     "PcCountPair",
 ]
+import importlib
