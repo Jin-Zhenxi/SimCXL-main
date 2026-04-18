@@ -157,6 +157,24 @@ def patch_metrics_from_debug_log(
     return metrics
 
 
+def determine_metrics_source(
+    stats_metrics: dict[str, float], patched_metrics: dict[str, float]
+) -> str:
+    if (
+        stats_metrics["computeCycles"] > 0
+        and stats_metrics["dmaRead"] > 0
+        and stats_metrics["dmaWrite"] > 0
+    ):
+        return "stats"
+    if (
+        patched_metrics["computeCycles"] > 0
+        and patched_metrics["dmaRead"] > 0
+        and patched_metrics["dmaWrite"] > 0
+    ):
+        return "debug_log_fallback"
+    return "missing"
+
+
 def extract_phase_timings(serial_log: Path) -> dict[str, float]:
     keys = [
         "phase1_ms",
@@ -181,6 +199,14 @@ def extract_phase_timings(serial_log: Path) -> dict[str, float]:
                 if match:
                     values[key] = float(match.group(1))
     return values
+
+
+def determine_timing_source(gemm_active_s: float, phase1_ms: float) -> str:
+    if gemm_active_s > 0:
+        return "debug_active_window"
+    if phase1_ms > 0:
+        return "phase1_ms_fallback"
+    return "missing"
 
 
 def serial_log_has_pure_gemm(serial_log: Path) -> bool:
@@ -434,10 +460,16 @@ def main() -> None:
                 run_status = f"failed({exc.returncode})"
                 error_msg = str(exc)
 
-        metrics = extract_roi_metrics(stats_file)
-        metrics = patch_metrics_from_debug_log(metrics, terminal_log)
+        stats_metrics = extract_roi_metrics(stats_file)
+        metrics = patch_metrics_from_debug_log(
+            dict(stats_metrics), terminal_log
+        )
+        metrics_source = determine_metrics_source(stats_metrics, metrics)
         phase = extract_phase_timings(serial_log)
         gemm_active_s = extract_gemm_active_time(str(terminal_log))
+        timing_source = determine_timing_source(
+            gemm_active_s, phase["phase1_ms"]
+        )
         gemm_wall_s = (
             gemm_active_s
             if gemm_active_s > 0
@@ -477,6 +509,8 @@ def main() -> None:
             "Matrix Size": args.matrix_size,
             "Run Status": run_status,
             "Workload OK": workload_ok,
+            "Metrics Source": metrics_source,
+            "Timing Source": timing_source,
             "ROI simSeconds": round(metrics["simSeconds"], 9),
             "totalComputeCycles": int(metrics["computeCycles"]),
             "DMA Read Bytes": int(metrics["dmaRead"]),
@@ -500,6 +534,8 @@ def main() -> None:
             f"pcie_hbm_{device_link_gbs}g: "
             f"phase1_ms={row['Phase-1 GEMM Time (ms)']}, "
             f"GEMM-Effective={row['GEMM-Effective (GFLOPS)']} GFLOPS, "
+            f"metrics_source={row['Metrics Source']}, "
+            f"timing_source={row['Timing Source']}, "
             f"ComputeShare={row['GEMM Compute Share (%)']}%, "
             f"status={run_status}"
         )

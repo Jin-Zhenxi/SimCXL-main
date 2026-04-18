@@ -170,7 +170,10 @@ board = X86Board(
 )
 cxl_dev = board.pc.south_bridge.cxl_device
 cxl_dev.cxl_mem_bus.width = device_link_width_bytes(args.device_link_gbs)
-cxl_dev.cxl_mem_bus.clk_domain = board.pcie_fabric_clk_domain
+fabric_clk_domain = board.__dict__.get(
+    "pcie_fabric_clk_domain", board.clk_domain
+)
+cxl_dev.cxl_mem_bus.clk_domain = fabric_clk_domain
 print(
     "[HBM+PCIe Config] "
     f"device_link_gbs={args.device_link_gbs}, "
