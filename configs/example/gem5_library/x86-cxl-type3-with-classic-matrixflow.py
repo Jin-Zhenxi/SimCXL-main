@@ -201,6 +201,18 @@ parser.add_argument(
     action="store_true",
 )
 parser.add_argument(
+    "--irregular-gemm-small-full-residency-pad256-first-cut",
+    "--irregular_gemm_small_full_residency_pad256_first_cut",
+    dest="irregular_gemm_small_full_residency_pad256_first_cut",
+    action="store_true",
+)
+parser.add_argument(
+    "--irregular-gemm-logical-zero-fill-clipped-execution-first-cut",
+    "--irregular_gemm_logical_zero_fill_clipped_execution_first_cut",
+    dest="irregular_gemm_logical_zero_fill_clipped_execution_first_cut",
+    action="store_true",
+)
+parser.add_argument(
     "--interior-writeback-stripe-rows",
     "--interior_writeback_stripe_rows",
     dest="interior_writeback_stripe_rows",
@@ -307,6 +319,113 @@ simcxl_root = os.path.abspath(os.path.join(script_dir, "..", "..", ".."))
 kernel_path = os.path.join(simcxl_root, "vmlinux")
 disk_path = os.path.join(simcxl_root, "parsec.img")
 script_path = os.path.join(simcxl_root, "script.sh")
+workload_is_pure_gemm = args.matrixflow_workload == "pure_gemm"
+logical_zero_fill_mode = (
+    args.irregular_gemm_logical_zero_fill_clipped_execution_first_cut
+)
+small_full_residency_mode = (
+    args.irregular_gemm_small_full_residency_pad256_first_cut
+)
+boundary_coalescing_mode = (
+    args.irregular_gemm_boundary_writeback_coalescing_first_cut
+)
+static_classifier_mode = (
+    args.irregular_gemm_static_output_tile_classifier_boundary_hold_first_cut
+)
+boundary_hold_body_wb_mode = (
+    args.irregular_gemm_boundary_only_hold_early_body_writeback_first_cut
+)
+completion_autopsy_mode = (
+    args.irregular_gemm_final_completion_chain_autopsy_first_cut
+)
+single_fused_corner_mode = (
+    args.irregular_gemm_single_fused_descriptor_corner_collapse_first_cut
+)
+b_tail_hold_mode = args.irregular_gemm_b_tail_scratchpad_output_hold_first_cut
+pack_tail_align16_mode = args.pure_gemm_pack_tail_align16
+trigger_mode_args = []
+if logical_zero_fill_mode:
+    trigger_mode_args = [
+        "irregular_gemm_logical_zero_fill_clipped_execution_first_cut"
+    ]
+elif small_full_residency_mode:
+    trigger_mode_args = [
+        "irregular_gemm_small_full_residency_pad256_first_cut"
+    ]
+elif (
+    args.irregular_gemm_streaming_body_writeback_first_cut
+    and workload_is_pure_gemm
+):
+    trigger_mode_args = ["irregular_gemm_streaming_body_writeback_first_cut"]
+elif boundary_coalescing_mode and workload_is_pure_gemm:
+    trigger_mode_args = [
+        "irregular_gemm_boundary_writeback_coalescing_first_cut"
+    ]
+elif static_classifier_mode:
+    trigger_mode_args = [
+        "irregular_gemm_static_output_tile_classifier_boundary_hold_first_cut"
+    ]
+elif boundary_hold_body_wb_mode and workload_is_pure_gemm:
+    trigger_mode_args = [
+        "irregular_gemm_boundary_only_hold_early_body_writeback_first_cut"
+    ]
+elif completion_autopsy_mode and workload_is_pure_gemm:
+    trigger_mode_args = [
+        "irregular_gemm_final_completion_chain_autopsy_first_cut"
+    ]
+elif single_fused_corner_mode and workload_is_pure_gemm:
+    trigger_mode_args = [
+        "irregular_gemm_single_fused_descriptor_corner_collapse_first_cut"
+    ]
+elif (
+    args.irregular_gemm_no_wait_fused_bottom_first_cut
+    and workload_is_pure_gemm
+):
+    trigger_mode_args = ["irregular_gemm_no_wait_fused_bottom_first_cut"]
+elif (
+    args.irregular_gemm_no_wait_fused_right_first_cut and workload_is_pure_gemm
+):
+    trigger_mode_args = ["irregular_gemm_no_wait_fused_right_first_cut"]
+elif (
+    args.irregular_gemm_residual_device_overhead_autopsy_first_cut
+    and workload_is_pure_gemm
+):
+    trigger_mode_args = [
+        "irregular_gemm_residual_device_overhead_autopsy_first_cut"
+    ]
+elif (
+    args.irregular_gemm_fused_right_edge_clean_timing_first_cut
+    and not args.irregular_gemm_residual_device_overhead_autopsy_first_cut
+    and workload_is_pure_gemm
+):
+    trigger_mode_args = [
+        "irregular_gemm_fused_right_edge_clean_timing_first_cut"
+    ]
+elif (
+    args.irregular_gemm_fused_edges_completion_optimized_first_cut
+    and workload_is_pure_gemm
+):
+    trigger_mode_args = [
+        "irregular_gemm_fused_edges_completion_optimized_first_cut"
+    ]
+elif b_tail_hold_mode and workload_is_pure_gemm:
+    trigger_mode_args = [
+        "irregular_gemm_b_tail_scratchpad_output_hold_first_cut"
+    ]
+elif (
+    args.pure_gemm_peeled_rect_batched_single_doorbell_first_cut
+    and workload_is_pure_gemm
+):
+    trigger_mode_args = ["peeled_rect_batched_single_doorbell_first_cut"]
+elif (
+    args.pure_gemm_peeled_rect_v2_right_edge_rectified
+    and workload_is_pure_gemm
+):
+    trigger_mode_args = ["peeled_rect_v2_right_edge_rectified"]
+elif args.pure_gemm_peeled_rect_v1 and workload_is_pure_gemm:
+    trigger_mode_args = ["peeled_rect_v1"]
+elif pack_tail_align16_mode and workload_is_pure_gemm:
+    trigger_mode_args = ["pack_tail_align16"]
 
 command = build_matrixflow_command(
     manual=args.manual,
@@ -317,71 +436,7 @@ command = build_matrixflow_command(
     allow_guest_fallback=args.allow_local_trigger,
     trigger_extra_args=[
         str(args.device_link_gbs),
-        *(
-            ["irregular_gemm_streaming_body_writeback_first_cut"]
-            if args.irregular_gemm_streaming_body_writeback_first_cut
-            and args.matrixflow_workload == "pure_gemm"
-            else ["irregular_gemm_boundary_writeback_coalescing_first_cut"]
-            if args.irregular_gemm_boundary_writeback_coalescing_first_cut
-            and args.matrixflow_workload == "pure_gemm"
-            else [
-                "irregular_gemm_static_output_tile_classifier_boundary_hold_first_cut"
-            ]
-            if args.irregular_gemm_static_output_tile_classifier_boundary_hold_first_cut
-            else [
-                "irregular_gemm_boundary_only_hold_early_body_writeback_first_cut"
-            ]
-            if args.irregular_gemm_boundary_only_hold_early_body_writeback_first_cut
-            and args.matrixflow_workload == "pure_gemm"
-            else ["irregular_gemm_final_completion_chain_autopsy_first_cut"]
-            if args.irregular_gemm_final_completion_chain_autopsy_first_cut
-            and args.matrixflow_workload == "pure_gemm"
-            else [
-                "irregular_gemm_single_fused_descriptor_corner_collapse_first_cut"
-            ]
-            if args.irregular_gemm_single_fused_descriptor_corner_collapse_first_cut
-            and args.matrixflow_workload == "pure_gemm"
-            else ["irregular_gemm_no_wait_fused_bottom_first_cut"]
-            if args.irregular_gemm_no_wait_fused_bottom_first_cut
-            and args.matrixflow_workload == "pure_gemm"
-            else ["irregular_gemm_no_wait_fused_right_first_cut"]
-            if args.irregular_gemm_no_wait_fused_right_first_cut
-            and args.matrixflow_workload == "pure_gemm"
-            else ["irregular_gemm_residual_device_overhead_autopsy_first_cut"]
-            if args.irregular_gemm_residual_device_overhead_autopsy_first_cut
-            and args.matrixflow_workload == "pure_gemm"
-            else ["irregular_gemm_fused_right_edge_clean_timing_first_cut"]
-            if (
-                args.irregular_gemm_fused_right_edge_clean_timing_first_cut
-                and not args.irregular_gemm_residual_device_overhead_autopsy_first_cut
-            )
-            and args.matrixflow_workload == "pure_gemm"
-            else ["irregular_gemm_fused_edges_completion_optimized_first_cut"]
-            if args.irregular_gemm_fused_edges_completion_optimized_first_cut
-            and args.matrixflow_workload == "pure_gemm"
-            else ["irregular_gemm_b_tail_scratchpad_output_hold_first_cut"]
-            if args.irregular_gemm_b_tail_scratchpad_output_hold_first_cut
-            and args.matrixflow_workload == "pure_gemm"
-            else ["peeled_rect_batched_single_doorbell_first_cut"]
-            if args.pure_gemm_peeled_rect_batched_single_doorbell_first_cut
-            and args.matrixflow_workload == "pure_gemm"
-            else (
-                ["peeled_rect_v2_right_edge_rectified"]
-                if args.pure_gemm_peeled_rect_v2_right_edge_rectified
-                and args.matrixflow_workload == "pure_gemm"
-                else (
-                    ["peeled_rect_v1"]
-                    if args.pure_gemm_peeled_rect_v1
-                    and args.matrixflow_workload == "pure_gemm"
-                    else (
-                        ["pack_tail_align16"]
-                        if args.pure_gemm_pack_tail_align16
-                        and args.matrixflow_workload == "pure_gemm"
-                        else []
-                    )
-                )
-            )
-        ),
+        *trigger_mode_args,
     ],
 )
 

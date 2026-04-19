@@ -55,6 +55,8 @@ enum PureGemmPrototypeMode {
     PURE_GEMM_PROTO_IRREGULAR_GEMM_STATIC_OUTPUT_TILE_CLASSIFIER_BOUNDARY_HOLD_FIRST_CUT = 13,
     PURE_GEMM_PROTO_IRREGULAR_GEMM_BOUNDARY_WRITEBACK_COALESCING_FIRST_CUT = 14,
     PURE_GEMM_PROTO_IRREGULAR_GEMM_STREAMING_BODY_WRITEBACK_FIRST_CUT = 15,
+    PURE_GEMM_PROTO_SMALL_FULL_RESIDENCY_PAD256 = 16,
+    PURE_GEMM_PROTO_LOGICAL_ZERO_FILL_CLIPPED_EXECUTION = 17,
 };
 
 enum DescriptorFlags {
@@ -72,6 +74,8 @@ enum DescriptorFlags {
     DESC_FLAG_IRREGULAR_STATIC_OUTPUT_TILE_CLASSIFIER_BOUNDARY_HOLD = 1u << 11,
     DESC_FLAG_IRREGULAR_BOUNDARY_WRITEBACK_COALESCING = 1u << 12,
     DESC_FLAG_IRREGULAR_STREAMING_BODY_WRITEBACK = 1u << 13,
+    DESC_FLAG_IRREGULAR_SMALL_FULL_RESIDENCY_PAD256 = 1u << 14,
+    DESC_FLAG_IRREGULAR_LOGICAL_ZERO_FILL_CLIPPED_EXECUTION = 1u << 15,
 };
 
 struct VitProxyConfig {
@@ -501,6 +505,20 @@ parse_pure_gemm_prototype_mode(const char *name)
                "irregular_gemm_streaming_body_writeback_first_cut") == 0) {
         return
             PURE_GEMM_PROTO_IRREGULAR_GEMM_STREAMING_BODY_WRITEBACK_FIRST_CUT;
+    }
+    if (name != NULL &&
+        strcmp(name,
+               "irregular_gemm_small_full_residency_pad256_first_cut") == 0) {
+        return
+            PURE_GEMM_PROTO_SMALL_FULL_RESIDENCY_PAD256;
+    }
+    if (name != NULL &&
+        strcmp(
+            name,
+            "irregular_gemm_logical_zero_fill_clipped_execution_first_cut") ==
+            0) {
+        return
+            PURE_GEMM_PROTO_LOGICAL_ZERO_FILL_CLIPPED_EXECUTION;
     }
     if (name != NULL &&
         strcmp(name,
@@ -1274,6 +1292,14 @@ main(int argc, char *argv[])
             (logical_matrix_size / peeled_block_size) * peeled_block_size;
         const uint32_t peeled_tail_dim =
             logical_matrix_size - peeled_main_dim;
+        const int small_full_residency_active =
+            pure_gemm_proto_mode ==
+                PURE_GEMM_PROTO_SMALL_FULL_RESIDENCY_PAD256 &&
+            logical_matrix_size > 0 && logical_matrix_size < 256U;
+        const int logical_zero_fill_active =
+            pure_gemm_proto_mode ==
+                PURE_GEMM_PROTO_LOGICAL_ZERO_FILL_CLIPPED_EXECUTION &&
+            logical_matrix_size > 0 && logical_matrix_size < 256U;
         const int irregular_rect_active =
             ((pure_gemm_proto_mode ==
                   PURE_GEMM_PROTO_IRREGULAR_GEMM_B_TAIL_SCRATCHPAD_OUTPUT_HOLD_FIRST_CUT) ||
@@ -1351,7 +1377,11 @@ main(int argc, char *argv[])
                 ? cfg.staged_block_bytes / sizeof(uint32_t)
                 : 1;
         const uint64_t tile_count_per_gemm =
-            peeled_rect_active
+            small_full_residency_active
+                ? 1ULL
+                : (logical_zero_fill_active
+                ? calc_tile_count(cfg.seq_len, 128U)
+                : (peeled_rect_active
                 ? (calc_rect_tile_count(peeled_main_dim, peeled_main_dim,
                                         logical_matrix_size, 128U) +
                    calc_rect_tile_count(peeled_main_dim, peeled_tail_dim,
@@ -1360,7 +1390,7 @@ main(int argc, char *argv[])
                                         logical_matrix_size, 128U) +
                    calc_rect_tile_count(peeled_tail_dim, peeled_tail_dim,
                                         logical_matrix_size, 128U))
-                : calc_tile_count(cfg.seq_len, 128U);
+                : calc_tile_count(cfg.seq_len, 128U)));
         const uint64_t total_tile_count =
             tile_count_per_gemm * (run_phase3 ? 2ULL : 1ULL);
         const uint32_t descriptor_launch_count =
@@ -1462,6 +1492,17 @@ main(int argc, char *argv[])
         if (tail_pack_active) {
             printf("[Config] pure_gemm_prototype=pack_tail_align16 packed_size=%u x %u\n",
                    matrix_size, matrix_size);
+        } else if (small_full_residency_active) {
+            printf("[Config] pure_gemm_prototype="
+                   "irregular_gemm_small_full_residency_pad256_first_cut "
+                   "effective_dim=%u padded_dim=256\n",
+                   logical_matrix_size);
+        } else if (logical_zero_fill_active) {
+            printf("[Config] pure_gemm_prototype="
+                   "irregular_gemm_logical_zero_fill_"
+                   "clipped_execution_first_cut "
+                   "valid_dim=%u tile_dim=128\n",
+                   logical_matrix_size);
         } else if (peeled_rect_active) {
             printf("[Config] pure_gemm_prototype=%s main_dim=%u tail_dim=%u\n",
                    pure_gemm_proto_mode ==
@@ -1929,6 +1970,12 @@ main(int argc, char *argv[])
                 }
             }
         } else {
+            if (small_full_residency_active) {
+                desc.flags = DESC_FLAG_IRREGULAR_SMALL_FULL_RESIDENCY_PAD256;
+            } else if (logical_zero_fill_active) {
+                desc.flags =
+                    DESC_FLAG_IRREGULAR_LOGICAL_ZERO_FILL_CLIPPED_EXECUTION;
+            }
             if (launch_descriptor(desc_ptr, flag_ptr, doorbell_ptr, desc_pa,
                                   &desc,
                                   make_completion_token(matrix_size, 1),
@@ -2310,7 +2357,16 @@ main(int argc, char *argv[])
                 desc.lda = matrix_size;
                 desc.ldb = matrix_size;
                 desc.ldc = matrix_size;
-                desc.flags = 0;
+                const uint32_t logical_zero_fill_flag = 1u << 15;
+
+                if (small_full_residency_active) {
+                    desc.flags =
+                        DESC_FLAG_IRREGULAR_SMALL_FULL_RESIDENCY_PAD256;
+                } else if (logical_zero_fill_active) {
+                    desc.flags = logical_zero_fill_flag;
+                } else {
+                    desc.flags = 0;
+                }
                 desc.completion_value = phase3_token;
                 if (prime_completion_flag(flag_ptr, phase3_sentinel) != 0) {
                     free(mlp_block);

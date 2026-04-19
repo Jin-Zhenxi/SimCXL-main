@@ -21,8 +21,10 @@ namespace gem5
 class MatrixFlowEngine : public ClockedObject
 {
   private:
-    /** Max tile dimension; buffer size and concurrent row DMA event pool. */
-    static constexpr int kMaxTileDim = 128;
+    /** Default mature tile dimension used by the existing mainline path. */
+    static constexpr int kDefaultTileDim = 128;
+    /** Max tile dimension supported by local buffers and row-event pools. */
+    static constexpr int kMaxTileDim = 256;
     static constexpr int kMaxBoundaryWriteEvents = 1024;
     /** Max bytes in one logical B row. */
     static constexpr size_t kMaxTileRowBytes =
@@ -31,6 +33,7 @@ class MatrixFlowEngine : public ClockedObject
     static constexpr uint32_t kMaxInFlight = 64;
     /** Fixed first-version quota for consecutive current-protected-B wins. */
     static constexpr uint32_t kCurrentProtectedBQuotaRows = 4;
+    static constexpr uint32_t kSmallFullResidencyPadDim = 256;
     /** Conservative gather budget for the no-starvation sidecar. */
     static constexpr uint32_t kCoverageGatherNoStarvationBudgetRows = 16;
     /** Do not let gather monopolize B issue arbitration. */
@@ -262,6 +265,10 @@ class MatrixFlowEngine : public ClockedObject
         kDescFlagIrregularBoundaryWritebackCoalescing = 1u << 12;
     static constexpr uint32_t
         kDescFlagIrregularStreamingBodyWriteback = 1u << 13;
+    static constexpr uint32_t
+        kDescFlagIrregularSmallFullResidencyPad256 = 1u << 14;
+    static constexpr uint32_t
+        kDescFlagIrregularLogicalZeroFillClippedExecution = 1u << 15;
 
     struct GemmContext
     {
@@ -279,9 +286,9 @@ class MatrixFlowEngine : public ClockedObject
         uint32_t flags = 0;
         uint64_t completionValue = 0;
         uint32_t elemBytes = sizeof(uint32_t);
-        uint32_t tileM = kMaxTileDim;
-        uint32_t tileN = kMaxTileDim;
-        uint32_t tileK = kMaxTileDim;
+        uint32_t tileM = kDefaultTileDim;
+        uint32_t tileN = kDefaultTileDim;
+        uint32_t tileK = kDefaultTileDim;
         uint32_t i = 0;
         uint32_t j = 0;
         uint32_t k = 0;
@@ -331,6 +338,19 @@ class MatrixFlowEngine : public ClockedObject
     uint32_t outputHoldLdc = 0;
     uint32_t outputHoldWritebackNextRow = 0;
     uint32_t outputHoldWritebackCompletedRows = 0;
+    bool smallFullResidencyActive = false;
+    uint32_t smallFullResidencyEffectiveDim = 0;
+    Addr smallFullResidencyLoadABytes = 0;
+    Addr smallFullResidencyLoadBBytes = 0;
+    Addr smallFullResidencyWritebackBytes = 0;
+    uint32_t smallFullResidencyLoadARow = 0;
+    uint32_t smallFullResidencyLoadBRow = 0;
+    uint32_t smallFullResidencyWritebackRow = 0;
+    Tick smallFullResidencyBeginTick = 0;
+    Tick smallFullResidencyComputeBeginTick = 0;
+    Tick smallFullResidencyComputeEndTick = 0;
+    Tick smallFullResidencyWritebackBeginTick = 0;
+    Tick smallFullResidencyWritebackEndTick = 0;
     bool irregularFusedEdgesCompletionOptimizedActive = false;
     bool aTailScratchpadValid = false;
     bool aTailScratchpadLoading = false;
@@ -489,6 +509,34 @@ class MatrixFlowEngine : public ClockedObject
         statistics::Scalar outputHoldReadForEpilogueCount;
         statistics::Scalar outputHoldFinalWritebackCount;
         statistics::Scalar outputHoldBytesWrittenBack;
+        statistics::Scalar smallFullResidencyCount;
+        statistics::Scalar smallFullResidencyPaddedDim;
+        statistics::Scalar smallFullResidencyEffectiveDim;
+        statistics::Scalar smallFullResidencyLoadBytes;
+        statistics::Scalar smallFullResidencyWritebackBytes;
+        statistics::Scalar smallFullResidencyPadBytes;
+        statistics::Scalar smallFullResidencyOutputHoldBytes;
+        statistics::Scalar smallFullResidencyLocalBufferPeak;
+        statistics::Scalar smallFullResidencyCompletionCycles;
+        statistics::Scalar smallFullResidencyUsefulMacRatio;
+        statistics::Scalar smallFullResidencyPadWasteRatio;
+        statistics::Scalar logicalZeroFillModeCount;
+        statistics::Scalar logicalZeroFillValidM;
+        statistics::Scalar logicalZeroFillValidN;
+        statistics::Scalar logicalZeroFillValidK;
+        statistics::Scalar effectiveInputLoadBytes;
+        statistics::Scalar zeroFillAppliedBytes;
+        statistics::Scalar paddingInputBytesAvoided;
+        statistics::Scalar clippedExecutionCount;
+        statistics::Scalar clippedMicroTileCount;
+        statistics::Scalar effectiveComputeCycles;
+        statistics::Scalar fullTileEquivalentCycles;
+        statistics::Scalar computeCyclesAvoidedByClipping;
+        statistics::Scalar effectiveWritebackBytes;
+        statistics::Scalar paddingWritebackBytesAvoided;
+        statistics::Scalar effectiveRegionWritebackCount;
+        statistics::Scalar logicalZeroFillPadWasteRatio;
+        statistics::Scalar effectiveUsefulMacRatio;
         statistics::Scalar bodyInteriorWritebackBytes;
         statistics::Scalar boundaryWritebackBytes;
         statistics::Scalar bodyInteriorWritebackDrainCycles;
@@ -905,6 +953,12 @@ class MatrixFlowEngine : public ClockedObject
     std::vector<uint8_t> aTailScratchpadBuffer;
     std::vector<uint8_t> aTailScratchpadBounceBuffer;
     std::vector<uint8_t> outputHoldBuffer;
+    std::vector<uint8_t> smallFullResidencyACompactBuffer;
+    std::vector<uint8_t> smallFullResidencyBCompactBuffer;
+    std::vector<uint8_t> smallFullResidencyAPaddedBuffer;
+    std::vector<uint8_t> smallFullResidencyBPaddedBuffer;
+    std::vector<uint8_t> smallFullResidencyCPaddedBuffer;
+    std::vector<uint8_t> smallFullResidencyWritebackBuffer;
     std::vector<Addr> fetchABounceReqAddr;
     std::vector<Addr> fetchABounceReqBytes;
     std::vector<Addr> fetchABounceRowBytes;
@@ -1108,6 +1162,9 @@ class MatrixFlowEngine : public ClockedObject
     EventFunctionWrapper tailScratchpadLoadCompleteEvent;
     EventFunctionWrapper aTailScratchpadLoadCompleteEvent;
     EventFunctionWrapper heldOutputWriteCompleteEvent;
+    EventFunctionWrapper smallFullResidencyLoadACompleteEvent;
+    EventFunctionWrapper smallFullResidencyLoadBCompleteEvent;
+    EventFunctionWrapper smallFullResidencyWritebackCompleteEvent;
 
     /** One completion event per row slot (avoids "Event already scheduled"). */
     std::vector<EventFunctionWrapper> fetchARowEvents;
@@ -1151,6 +1208,11 @@ class MatrixFlowEngine : public ClockedObject
     bool irregularStaticOutputTileClassifierBoundaryHoldMode() const;
     bool irregularBoundaryWritebackCoalescingMode() const;
     bool irregularStreamingBodyWritebackMode() const;
+    bool irregularSmallFullResidencyPad256Mode() const;
+    bool irregularLogicalZeroFillClippedExecutionMode() const;
+    bool smallFullResidencySupported() const;
+    bool logicalZeroFillClippedExecutionSupported() const;
+    bool currentTileNeedsLogicalClipping() const;
     bool currentSubproblemUsesTailScratchpad() const;
     bool currentSubproblemUsesOutputHold() const;
     bool currentSubproblemUsesFusedEdges() const;
@@ -1178,6 +1240,18 @@ class MatrixFlowEngine : public ClockedObject
     void accumulateFusedBottomEdgeFromCurrentBTile();
     void accumulateFusedCornerFromCurrentTiles();
     void onHeldOutputWriteComplete();
+    void startSmallFullResidencyPath();
+    void issueSmallFullResidencyLoadA();
+    void issueSmallFullResidencyLoadARow();
+    void onSmallFullResidencyLoadAComplete();
+    void issueSmallFullResidencyLoadB();
+    void issueSmallFullResidencyLoadBRow();
+    void onSmallFullResidencyLoadBComplete();
+    void launchSmallFullResidencyCompute();
+    void accumulateSmallFullResidencyCompute();
+    void issueSmallFullResidencyWriteback();
+    void issueSmallFullResidencyWritebackRow();
+    void onSmallFullResidencyWritebackComplete();
     const char *outputTileClassName(OutputTileClass tileClass) const;
     void precomputeStaticOutputTileClassification();
     OutputTileClass outputTileClassForRegion(uint32_t rowStart,

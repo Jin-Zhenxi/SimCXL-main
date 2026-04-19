@@ -262,6 +262,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
     )
     parser.add_argument(
+        "--irregular-gemm-small-full-residency-pad256-first-cut",
+        "--irregular_gemm_small_full_residency_pad256_first_cut",
+        dest="irregular_gemm_small_full_residency_pad256_first_cut",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--irregular-gemm-logical-zero-fill-clipped-execution-first-cut",
+        "--irregular_gemm_logical_zero_fill_clipped_execution_first_cut",
+        dest="irregular_gemm_logical_zero_fill_clipped_execution_first_cut",
+        action="store_true",
+    )
+    parser.add_argument(
         "--interior-writeback-stripe-rows",
         "--interior_writeback_stripe_rows",
         dest="interior_writeback_stripe_rows",
@@ -658,6 +670,10 @@ def main() -> None:
         run_tag += "__boundary_coalesce"
     if args.irregular_gemm_streaming_body_writeback_first_cut:
         run_tag += "__stream_body_wb"
+    if args.irregular_gemm_small_full_residency_pad256_first_cut:
+        run_tag += "__small_full_residency"
+    if args.irregular_gemm_logical_zero_fill_clipped_execution_first_cut:
+        run_tag += "__logical_zero_fill"
     if args.interior_writeback_stripe_rows > 0:
         run_tag += f"__wbstripe{args.interior_writeback_stripe_rows}"
     if args.max_outstanding_stripes > 0:
@@ -709,6 +725,191 @@ def main() -> None:
             gem5_env[
                 "MATRIXFLOW_BODY_INTERIOR_WRITEBACK_MAX_OUTSTANDING_STRIPES"
             ] = str(args.max_outstanding_stripes)
+        static_classifier_mode = getattr(
+            args,
+            "irregular_gemm_static_output_tile_classifier_"
+            "boundary_hold_first_cut",
+        )
+        boundary_hold_body_wb_mode = getattr(
+            args,
+            "irregular_gemm_boundary_only_hold_early_body_"
+            "writeback_first_cut",
+        )
+        fused_corner_collapse_mode = getattr(
+            args,
+            "irregular_gemm_single_fused_descriptor_corner_"
+            "collapse_first_cut",
+        )
+        optional_args = []
+        if args.interior_writeback_stripe_rows > 0:
+            optional_args.append(
+                "--interior-writeback-stripe-rows "
+                f"{args.interior_writeback_stripe_rows}"
+            )
+        if args.max_outstanding_stripes > 0:
+            optional_args.append(
+                "--max-outstanding-stripes " f"{args.max_outstanding_stripes}"
+            )
+        if args.boundary_right_writeback_bytes != 4:
+            optional_args.append(
+                "--boundary-right-writeback-bytes "
+                f"{args.boundary_right_writeback_bytes}"
+            )
+        if args.irregular_gemm_streaming_body_writeback_first_cut:
+            optional_args.append(
+                "--irregular-gemm-streaming-body-writeback-first-cut"
+            )
+        if args.irregular_gemm_small_full_residency_pad256_first_cut:
+            optional_args.append(
+                "--irregular-gemm-small-full-residency-pad256-first-cut"
+            )
+        if args.irregular_gemm_logical_zero_fill_clipped_execution_first_cut:
+            optional_args.append(
+                "--irregular-gemm-logical-zero-fill-clipped-execution-"
+                "first-cut"
+            )
+        if args.irregular_gemm_boundary_writeback_coalescing_first_cut:
+            optional_args.append(
+                "--irregular-gemm-boundary-writeback-coalescing-first-cut"
+            )
+        if static_classifier_mode:
+            optional_args.append(
+                "--irregular-gemm-static-output-tile-classifier-"
+                "boundary-hold-first-cut"
+            )
+        if boundary_hold_body_wb_mode:
+            optional_args.append(
+                "--irregular-gemm-boundary-only-hold-early-body-writeback-"
+                "first-cut"
+            )
+        if args.irregular_gemm_final_completion_chain_autopsy_first_cut:
+            optional_args.append(
+                "--irregular-gemm-final-completion-chain-autopsy-first-cut"
+            )
+        if fused_corner_collapse_mode:
+            optional_args.append(
+                "--irregular-gemm-single-fused-descriptor-corner-collapse-"
+                "first-cut"
+            )
+        if args.irregular_gemm_no_wait_fused_bottom_first_cut:
+            optional_args.append(
+                "--irregular-gemm-no-wait-fused-bottom-first-cut"
+            )
+        if args.irregular_gemm_no_wait_fused_right_first_cut:
+            optional_args.append(
+                "--irregular-gemm-no-wait-fused-right-first-cut"
+            )
+        if args.irregular_gemm_residual_device_overhead_autopsy_first_cut:
+            optional_args.append(
+                "--irregular-gemm-residual-device-overhead-autopsy-"
+                "first-cut"
+            )
+        fused_corner_blocked = (
+            args.irregular_gemm_final_completion_chain_autopsy_first_cut
+            or args.irregular_gemm_no_wait_fused_right_first_cut
+            or args.irregular_gemm_no_wait_fused_bottom_first_cut
+            or fused_corner_collapse_mode
+        )
+        fused_edges_blocked = (
+            args.irregular_gemm_final_completion_chain_autopsy_first_cut
+            or args.irregular_gemm_fused_right_edge_clean_timing_first_cut
+            or args.irregular_gemm_residual_device_overhead_autopsy_first_cut
+            or args.irregular_gemm_no_wait_fused_right_first_cut
+            or args.irregular_gemm_no_wait_fused_bottom_first_cut
+            or fused_corner_collapse_mode
+        )
+        b_tail_hold_blocked = (
+            args.irregular_gemm_final_completion_chain_autopsy_first_cut
+            or args.irregular_gemm_fused_edges_completion_optimized_first_cut
+            or args.irregular_gemm_fused_right_edge_clean_timing_first_cut
+            or args.irregular_gemm_no_wait_fused_right_first_cut
+            or args.irregular_gemm_no_wait_fused_bottom_first_cut
+            or fused_corner_collapse_mode
+        )
+        peeled_single_doorbell_blocked = (
+            args.irregular_gemm_final_completion_chain_autopsy_first_cut
+            or args.irregular_gemm_b_tail_scratchpad_output_hold_first_cut
+            or args.irregular_gemm_fused_edges_completion_optimized_first_cut
+            or args.irregular_gemm_fused_right_edge_clean_timing_first_cut
+            or args.irregular_gemm_no_wait_fused_right_first_cut
+            or args.irregular_gemm_no_wait_fused_bottom_first_cut
+            or fused_corner_collapse_mode
+        )
+        peeled_v2_blocked = (
+            args.irregular_gemm_final_completion_chain_autopsy_first_cut
+            or args.pure_gemm_peeled_rect_batched_single_doorbell_first_cut
+            or args.irregular_gemm_b_tail_scratchpad_output_hold_first_cut
+            or args.irregular_gemm_fused_edges_completion_optimized_first_cut
+            or args.irregular_gemm_fused_right_edge_clean_timing_first_cut
+            or args.irregular_gemm_no_wait_fused_right_first_cut
+            or args.irregular_gemm_no_wait_fused_bottom_first_cut
+            or fused_corner_collapse_mode
+        )
+        peeled_v1_blocked = (
+            args.irregular_gemm_final_completion_chain_autopsy_first_cut
+            or args.pure_gemm_peeled_rect_v2_right_edge_rectified
+            or args.pure_gemm_peeled_rect_batched_single_doorbell_first_cut
+            or args.irregular_gemm_b_tail_scratchpad_output_hold_first_cut
+            or args.irregular_gemm_fused_edges_completion_optimized_first_cut
+            or args.irregular_gemm_fused_right_edge_clean_timing_first_cut
+            or args.irregular_gemm_no_wait_fused_right_first_cut
+            or args.irregular_gemm_no_wait_fused_bottom_first_cut
+            or fused_corner_collapse_mode
+        )
+        pack_tail_blocked = (
+            args.irregular_gemm_final_completion_chain_autopsy_first_cut
+            or args.pure_gemm_peeled_rect_v1
+            or args.pure_gemm_peeled_rect_v2_right_edge_rectified
+            or args.pure_gemm_peeled_rect_batched_single_doorbell_first_cut
+            or args.irregular_gemm_b_tail_scratchpad_output_hold_first_cut
+            or args.irregular_gemm_fused_edges_completion_optimized_first_cut
+            or args.irregular_gemm_fused_right_edge_clean_timing_first_cut
+            or args.irregular_gemm_no_wait_fused_right_first_cut
+            or args.irregular_gemm_no_wait_fused_bottom_first_cut
+            or fused_corner_collapse_mode
+        )
+        if (
+            args.irregular_gemm_fused_right_edge_clean_timing_first_cut
+            and not fused_corner_blocked
+        ):
+            optional_args.append(
+                "--irregular-gemm-fused-right-edge-clean-timing-first-cut"
+            )
+        if (
+            args.irregular_gemm_fused_edges_completion_optimized_first_cut
+            and not fused_edges_blocked
+        ):
+            optional_args.append(
+                "--irregular-gemm-fused-edges-completion-optimized-first-cut"
+            )
+        if (
+            args.irregular_gemm_b_tail_scratchpad_output_hold_first_cut
+            and not b_tail_hold_blocked
+        ):
+            optional_args.append(
+                "--irregular-gemm-b-tail-scratchpad-output-hold-first-cut"
+            )
+        if (
+            args.pure_gemm_peeled_rect_batched_single_doorbell_first_cut
+            and not peeled_single_doorbell_blocked
+        ):
+            optional_args.append(
+                "--pure-gemm-peeled-rect-batched-single-doorbell-first-cut"
+            )
+        if (
+            args.pure_gemm_peeled_rect_v2_right_edge_rectified
+            and not peeled_v2_blocked
+        ):
+            optional_args.append(
+                "--pure-gemm-peeled-rect-v2-right-edge-rectified"
+            )
+        if args.pure_gemm_peeled_rect_v1 and not peeled_v1_blocked:
+            optional_args.append("--pure-gemm-peeled-rect-v1")
+        if args.pure_gemm_pack_tail_align16 and not pack_tail_blocked:
+            optional_args.append("--pure-gemm-pack-tail-align16")
+        optional_flags = ""
+        if optional_args:
+            optional_flags = " ".join(optional_args) + " "
         cmd = (
             f"{GEM5_BIN} -p {GEM5_ROOT / 'src/python'} "
             "--debug-flags=MatrixFlowTiming "
@@ -720,25 +921,7 @@ def main() -> None:
             f"--matrixflow_size {args.matrix_size} "
             "--matrixflow_workload pure_gemm "
             f"--device-link-gbs {args.device_link_gbs} "
-            f"{f'--interior-writeback-stripe-rows {args.interior_writeback_stripe_rows} ' if args.interior_writeback_stripe_rows > 0 else ''}"
-            f"{f'--max-outstanding-stripes {args.max_outstanding_stripes} ' if args.max_outstanding_stripes > 0 else ''}"
-            f"{f'--boundary-right-writeback-bytes {args.boundary_right_writeback_bytes} ' if args.boundary_right_writeback_bytes != 4 else ''}"
-            f"{'--irregular-gemm-streaming-body-writeback-first-cut ' if args.irregular_gemm_streaming_body_writeback_first_cut else ''}"
-            f"{'--irregular-gemm-boundary-writeback-coalescing-first-cut ' if args.irregular_gemm_boundary_writeback_coalescing_first_cut else ''}"
-            f"{'--irregular-gemm-static-output-tile-classifier-boundary-hold-first-cut ' if args.irregular_gemm_static_output_tile_classifier_boundary_hold_first_cut else ''}"
-            f"{'--irregular-gemm-boundary-only-hold-early-body-writeback-first-cut ' if args.irregular_gemm_boundary_only_hold_early_body_writeback_first_cut else ''}"
-            f"{'--irregular-gemm-final-completion-chain-autopsy-first-cut ' if args.irregular_gemm_final_completion_chain_autopsy_first_cut else ''}"
-            f"{'--irregular-gemm-single-fused-descriptor-corner-collapse-first-cut ' if args.irregular_gemm_single_fused_descriptor_corner_collapse_first_cut else ''}"
-            f"{'--irregular-gemm-no-wait-fused-bottom-first-cut ' if args.irregular_gemm_no_wait_fused_bottom_first_cut else ''}"
-            f"{'--irregular-gemm-no-wait-fused-right-first-cut ' if args.irregular_gemm_no_wait_fused_right_first_cut else ''}"
-            f"{'--irregular-gemm-residual-device-overhead-autopsy-first-cut ' if args.irregular_gemm_residual_device_overhead_autopsy_first_cut else ''}"
-            f"{'--irregular-gemm-fused-right-edge-clean-timing-first-cut ' if (args.irregular_gemm_fused_right_edge_clean_timing_first_cut and not args.irregular_gemm_final_completion_chain_autopsy_first_cut and not args.irregular_gemm_no_wait_fused_right_first_cut and not args.irregular_gemm_no_wait_fused_bottom_first_cut and not args.irregular_gemm_single_fused_descriptor_corner_collapse_first_cut) else ''}"
-            f"{'--irregular-gemm-fused-edges-completion-optimized-first-cut ' if (args.irregular_gemm_fused_edges_completion_optimized_first_cut and not args.irregular_gemm_final_completion_chain_autopsy_first_cut and not args.irregular_gemm_fused_right_edge_clean_timing_first_cut and not args.irregular_gemm_residual_device_overhead_autopsy_first_cut and not args.irregular_gemm_no_wait_fused_right_first_cut and not args.irregular_gemm_no_wait_fused_bottom_first_cut and not args.irregular_gemm_single_fused_descriptor_corner_collapse_first_cut) else ''}"
-            f"{'--irregular-gemm-b-tail-scratchpad-output-hold-first-cut ' if (args.irregular_gemm_b_tail_scratchpad_output_hold_first_cut and not args.irregular_gemm_final_completion_chain_autopsy_first_cut and not args.irregular_gemm_fused_edges_completion_optimized_first_cut and not args.irregular_gemm_fused_right_edge_clean_timing_first_cut and not args.irregular_gemm_no_wait_fused_right_first_cut and not args.irregular_gemm_no_wait_fused_bottom_first_cut and not args.irregular_gemm_single_fused_descriptor_corner_collapse_first_cut) else ''}"
-            f"{'--pure-gemm-peeled-rect-batched-single-doorbell-first-cut ' if (args.pure_gemm_peeled_rect_batched_single_doorbell_first_cut and not args.irregular_gemm_final_completion_chain_autopsy_first_cut and not args.irregular_gemm_b_tail_scratchpad_output_hold_first_cut and not args.irregular_gemm_fused_edges_completion_optimized_first_cut and not args.irregular_gemm_fused_right_edge_clean_timing_first_cut and not args.irregular_gemm_no_wait_fused_right_first_cut and not args.irregular_gemm_no_wait_fused_bottom_first_cut and not args.irregular_gemm_single_fused_descriptor_corner_collapse_first_cut) else ''}"
-            f"{'--pure-gemm-peeled-rect-v2-right-edge-rectified ' if (args.pure_gemm_peeled_rect_v2_right_edge_rectified and not args.irregular_gemm_final_completion_chain_autopsy_first_cut and not args.pure_gemm_peeled_rect_batched_single_doorbell_first_cut and not args.irregular_gemm_b_tail_scratchpad_output_hold_first_cut and not args.irregular_gemm_fused_edges_completion_optimized_first_cut and not args.irregular_gemm_fused_right_edge_clean_timing_first_cut and not args.irregular_gemm_no_wait_fused_right_first_cut and not args.irregular_gemm_no_wait_fused_bottom_first_cut and not args.irregular_gemm_single_fused_descriptor_corner_collapse_first_cut) else ''}"
-            f"{'--pure-gemm-peeled-rect-v1 ' if (args.pure_gemm_peeled_rect_v1 and not args.irregular_gemm_final_completion_chain_autopsy_first_cut and not args.pure_gemm_peeled_rect_v2_right_edge_rectified and not args.pure_gemm_peeled_rect_batched_single_doorbell_first_cut and not args.irregular_gemm_b_tail_scratchpad_output_hold_first_cut and not args.irregular_gemm_fused_edges_completion_optimized_first_cut and not args.irregular_gemm_fused_right_edge_clean_timing_first_cut and not args.irregular_gemm_no_wait_fused_right_first_cut and not args.irregular_gemm_no_wait_fused_bottom_first_cut and not args.irregular_gemm_single_fused_descriptor_corner_collapse_first_cut) else ''}"
-            f"{'--pure-gemm-pack-tail-align16 ' if (args.pure_gemm_pack_tail_align16 and not args.irregular_gemm_final_completion_chain_autopsy_first_cut and not args.pure_gemm_peeled_rect_v1 and not args.pure_gemm_peeled_rect_v2_right_edge_rectified and not args.pure_gemm_peeled_rect_batched_single_doorbell_first_cut and not args.irregular_gemm_b_tail_scratchpad_output_hold_first_cut and not args.irregular_gemm_fused_edges_completion_optimized_first_cut and not args.irregular_gemm_fused_right_edge_clean_timing_first_cut and not args.irregular_gemm_no_wait_fused_right_first_cut and not args.irregular_gemm_no_wait_fused_bottom_first_cut and not args.irregular_gemm_single_fused_descriptor_corner_collapse_first_cut) else ''}"
+            f"{optional_flags}"
             "--allow-local-trigger "
             f"> {terminal_log} 2>&1"
         )

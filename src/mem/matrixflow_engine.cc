@@ -229,6 +229,30 @@ MatrixFlowEngine::MatrixFlowEngine(const Params &p)
       tailScratchpadBuffer(),
       aTailScratchpadBuffer(),
       outputHoldBuffer(),
+      smallFullResidencyACompactBuffer(
+          kSmallFullResidencyPadDim * kSmallFullResidencyPadDim *
+              sizeof(uint32_t),
+          0),
+      smallFullResidencyBCompactBuffer(
+          kSmallFullResidencyPadDim * kSmallFullResidencyPadDim *
+              sizeof(uint32_t),
+          0),
+      smallFullResidencyAPaddedBuffer(
+          kSmallFullResidencyPadDim * kSmallFullResidencyPadDim *
+              sizeof(uint32_t),
+          0),
+      smallFullResidencyBPaddedBuffer(
+          kSmallFullResidencyPadDim * kSmallFullResidencyPadDim *
+              sizeof(uint32_t),
+          0),
+      smallFullResidencyCPaddedBuffer(
+          kSmallFullResidencyPadDim * kSmallFullResidencyPadDim *
+              sizeof(uint32_t),
+          0),
+      smallFullResidencyWritebackBuffer(
+          kSmallFullResidencyPadDim * kSmallFullResidencyPadDim *
+              sizeof(uint32_t),
+          0),
       nextFetchARowGeneration(kMaxTileDim, 0),
       nextFetchBRowGeneration(kMaxTileDim, 0),
       nextOutputFetchBRowGeneration(kMaxTileDim, 0),
@@ -301,6 +325,15 @@ MatrixFlowEngine::MatrixFlowEngine(const Params &p)
       heldOutputWriteCompleteEvent(
           [this] { onHeldOutputWriteComplete(); },
           name() + ".held_output_write"),
+      smallFullResidencyLoadACompleteEvent(
+          [this] { onSmallFullResidencyLoadAComplete(); },
+          name() + ".small_full_residency_load_a"),
+      smallFullResidencyLoadBCompleteEvent(
+          [this] { onSmallFullResidencyLoadBComplete(); },
+          name() + ".small_full_residency_load_b"),
+      smallFullResidencyWritebackCompleteEvent(
+          [this] { onSmallFullResidencyWritebackComplete(); },
+          name() + ".small_full_residency_writeback"),
       stats(this)
 {
     fetchARowEvents.reserve(kMaxTileDim);
@@ -658,6 +691,74 @@ MatrixFlowEngine::EngineStats::EngineStats(statistics::Group *parent)
                "How many final writeback passes irregular output hold issued"),
       ADD_STAT(outputHoldBytesWrittenBack, statistics::units::Byte::get(),
                "How many bytes were written back from irregular output hold"),
+      ADD_STAT(smallFullResidencyCount, statistics::units::Count::get(),
+               "How many GEMMs used the small full-residency pad256 path"),
+      ADD_STAT(smallFullResidencyPaddedDim, statistics::units::Count::get(),
+               "Accumulated padded dimension used by small full-residency"),
+      ADD_STAT(smallFullResidencyEffectiveDim,
+               statistics::units::Count::get(),
+               "Accumulated effective dimension handled by "
+               "small full-residency"),
+      ADD_STAT(smallFullResidencyLoadBytes,
+               statistics::units::Byte::get(),
+               "Bytes loaded into local buffers by small full-residency"),
+      ADD_STAT(smallFullResidencyWritebackBytes,
+               statistics::units::Byte::get(),
+               "Effective-region bytes written back by small full-residency"),
+      ADD_STAT(smallFullResidencyPadBytes, statistics::units::Byte::get(),
+               "Logical zero-padding bytes materialized locally"),
+      ADD_STAT(smallFullResidencyOutputHoldBytes,
+               statistics::units::Byte::get(),
+               "Local padded output bytes reserved by small full-residency"),
+      ADD_STAT(smallFullResidencyLocalBufferPeak,
+               statistics::units::Byte::get(),
+               "Peak total local buffer footprint of small full-residency"),
+      ADD_STAT(smallFullResidencyCompletionCycles,
+               statistics::units::Cycle::get(),
+               "Cycles from small full-residency begin to completion visible"),
+      ADD_STAT(smallFullResidencyUsefulMacRatio,
+               statistics::units::Count::get(),
+               "Useful MAC ratio scaled by 1000 for small full-residency"),
+      ADD_STAT(smallFullResidencyPadWasteRatio,
+               statistics::units::Count::get(),
+               "Padding waste ratio scaled by 1000 for small full-residency"),
+      ADD_STAT(logicalZeroFillModeCount, statistics::units::Count::get(),
+               "How many GEMMs used the logical zero-fill clipped path"),
+      ADD_STAT(logicalZeroFillValidM, statistics::units::Count::get(),
+               "Accumulated valid M observed by logical zero-fill"),
+      ADD_STAT(logicalZeroFillValidN, statistics::units::Count::get(),
+               "Accumulated valid N observed by logical zero-fill"),
+      ADD_STAT(logicalZeroFillValidK, statistics::units::Count::get(),
+               "Accumulated valid K observed by logical zero-fill"),
+      ADD_STAT(effectiveInputLoadBytes, statistics::units::Byte::get(),
+               "Effective input bytes loaded by logical zero-fill tiles"),
+      ADD_STAT(zeroFillAppliedBytes, statistics::units::Byte::get(),
+               "Logical zero-fill bytes implied inside clipped tiles"),
+      ADD_STAT(paddingInputBytesAvoided, statistics::units::Byte::get(),
+               "Padding input bytes avoided on DMA by logical zero-fill"),
+      ADD_STAT(clippedExecutionCount, statistics::units::Count::get(),
+               "How many clipped tiles executed under logical zero-fill"),
+      ADD_STAT(clippedMicroTileCount, statistics::units::Count::get(),
+               "Approximate clipped micro-tile count under logical zero-fill"),
+      ADD_STAT(effectiveComputeCycles, statistics::units::Cycle::get(),
+               "Compute cycles charged to effective clipped execution"),
+      ADD_STAT(fullTileEquivalentCycles, statistics::units::Cycle::get(),
+               "Full tile equivalent cycles before clipped execution"),
+      ADD_STAT(computeCyclesAvoidedByClipping,
+               statistics::units::Cycle::get(),
+               "Compute cycles avoided by clipping partial tiles"),
+      ADD_STAT(effectiveWritebackBytes, statistics::units::Byte::get(),
+               "Effective-region bytes written back by logical zero-fill"),
+      ADD_STAT(paddingWritebackBytesAvoided, statistics::units::Byte::get(),
+               "Padding writeback bytes skipped by logical zero-fill"),
+      ADD_STAT(effectiveRegionWritebackCount,
+               statistics::units::Count::get(),
+               "How many writebacks were clipped to effective output region"),
+      ADD_STAT(logicalZeroFillPadWasteRatio,
+               statistics::units::Count::get(),
+               "Padding waste ratio scaled by 1000 for logical zero-fill"),
+      ADD_STAT(effectiveUsefulMacRatio, statistics::units::Count::get(),
+               "Useful MAC ratio scaled by 1000 for logical zero-fill"),
       ADD_STAT(bodyInteriorWritebackBytes, statistics::units::Byte::get(),
                "Bytes written by early body-interior writeback"),
       ADD_STAT(boundaryWritebackBytes, statistics::units::Byte::get(),
@@ -1671,6 +1772,19 @@ MatrixFlowEngine::resetContext()
     outputHoldLdc = 0;
     outputHoldWritebackNextRow = 0;
     outputHoldWritebackCompletedRows = 0;
+    smallFullResidencyActive = false;
+    smallFullResidencyEffectiveDim = 0;
+    smallFullResidencyLoadABytes = 0;
+    smallFullResidencyLoadBBytes = 0;
+    smallFullResidencyWritebackBytes = 0;
+    smallFullResidencyLoadARow = 0;
+    smallFullResidencyLoadBRow = 0;
+    smallFullResidencyWritebackRow = 0;
+    smallFullResidencyBeginTick = 0;
+    smallFullResidencyComputeBeginTick = 0;
+    smallFullResidencyComputeEndTick = 0;
+    smallFullResidencyWritebackBeginTick = 0;
+    smallFullResidencyWritebackEndTick = 0;
     irregularFusedEdgesCompletionOptimizedActive = false;
     aTailScratchpadValid = false;
     aTailScratchpadLoading = false;
@@ -2076,6 +2190,53 @@ bool
 MatrixFlowEngine::irregularStreamingBodyWritebackMode() const
 {
     return (ctx.flags & kDescFlagIrregularStreamingBodyWriteback);
+}
+
+bool
+MatrixFlowEngine::irregularSmallFullResidencyPad256Mode() const
+{
+    return (ctx.flags & kDescFlagIrregularSmallFullResidencyPad256);
+}
+
+bool
+MatrixFlowEngine::irregularLogicalZeroFillClippedExecutionMode() const
+{
+    return (ctx.flags & kDescFlagIrregularLogicalZeroFillClippedExecution);
+}
+
+bool
+MatrixFlowEngine::smallFullResidencySupported() const
+{
+    return irregularSmallFullResidencyPad256Mode() &&
+           ctx.mTotal > 0 &&
+           ctx.mTotal < kSmallFullResidencyPadDim &&
+           ctx.mTotal == ctx.nTotal &&
+           ctx.mTotal == ctx.kTotal &&
+           ctx.lda == ctx.kTotal &&
+           ctx.ldb == ctx.nTotal &&
+           ctx.ldc == ctx.nTotal;
+}
+
+bool
+MatrixFlowEngine::logicalZeroFillClippedExecutionSupported() const
+{
+    return irregularLogicalZeroFillClippedExecutionMode() &&
+           ctx.mTotal > 0 &&
+           ctx.mTotal < kSmallFullResidencyPadDim &&
+           ctx.mTotal == ctx.nTotal &&
+           ctx.mTotal == ctx.kTotal &&
+           ctx.lda == ctx.kTotal &&
+           ctx.ldb == ctx.nTotal &&
+           ctx.ldc == ctx.nTotal;
+}
+
+bool
+MatrixFlowEngine::currentTileNeedsLogicalClipping() const
+{
+    return logicalZeroFillClippedExecutionSupported() &&
+           (ctx.curTileM < ctx.tileM ||
+            ctx.curTileN < ctx.tileN ||
+            ctx.curTileK < ctx.tileK);
 }
 
 bool
@@ -3057,11 +3218,11 @@ MatrixFlowEngine::precomputeStaticOutputTileClassification()
     DPRINTF(MatrixFlowTiming,
             "outputTileClassifierBegin: rows=%u cols=%u tileDim=%u tick=%llu\n",
             outputHoldRows, outputHoldCols,
-            static_cast<uint32_t>(kMaxTileDim),
+            static_cast<uint32_t>(kDefaultTileDim),
             static_cast<unsigned long long>(
                 staticOutputTileClassifierBeginTick));
 
-    staticOutputTileDim = static_cast<uint32_t>(kMaxTileDim);
+    staticOutputTileDim = static_cast<uint32_t>(kDefaultTileDim);
     staticOutputTileRows =
         (outputHoldRows + staticOutputTileDim - 1) / staticOutputTileDim;
     staticOutputTileCols =
@@ -3856,6 +4017,281 @@ MatrixFlowEngine::onHeldOutputWriteComplete()
         return;
     }
     trySendMoreHeldOutput();
+}
+
+void
+MatrixFlowEngine::startSmallFullResidencyPath()
+{
+    const uint32_t effective_dim = ctx.mTotal;
+    const uint64_t elem_bytes = ctx.elemBytes;
+    const uint64_t effective_bytes =
+        static_cast<uint64_t>(effective_dim) * effective_dim * elem_bytes;
+    const uint64_t padded_bytes =
+        static_cast<uint64_t>(kSmallFullResidencyPadDim) *
+        kSmallFullResidencyPadDim * elem_bytes;
+    const uint64_t peak_local_bytes =
+        effective_bytes * 2ULL + padded_bytes * 3ULL + effective_bytes;
+    const uint64_t useful_macs =
+        static_cast<uint64_t>(effective_dim) * effective_dim * effective_dim;
+    const uint64_t padded_macs =
+        static_cast<uint64_t>(kSmallFullResidencyPadDim) *
+        kSmallFullResidencyPadDim * kSmallFullResidencyPadDim;
+    const uint64_t useful_ratio =
+        padded_macs == 0 ? 0 : (useful_macs * 1000ULL) / padded_macs;
+
+    smallFullResidencyActive = true;
+    smallFullResidencyEffectiveDim = effective_dim;
+    smallFullResidencyLoadABytes = effective_bytes;
+    smallFullResidencyLoadBBytes = effective_bytes;
+    smallFullResidencyWritebackBytes = effective_bytes;
+    smallFullResidencyBeginTick = curTick();
+    smallFullResidencyComputeBeginTick = 0;
+    smallFullResidencyComputeEndTick = 0;
+    smallFullResidencyWritebackBeginTick = 0;
+    smallFullResidencyWritebackEndTick = 0;
+    outputHoldRows = kSmallFullResidencyPadDim;
+    outputHoldCols = kSmallFullResidencyPadDim;
+
+    stats.smallFullResidencyCount++;
+    stats.smallFullResidencyPaddedDim += kSmallFullResidencyPadDim;
+    stats.smallFullResidencyEffectiveDim += effective_dim;
+    stats.smallFullResidencyLoadBytes += effective_bytes * 2ULL;
+    stats.smallFullResidencyWritebackBytes += effective_bytes;
+    stats.smallFullResidencyPadBytes +=
+        padded_bytes * 3ULL - effective_bytes * 3ULL;
+    stats.smallFullResidencyOutputHoldBytes += padded_bytes;
+    stats.smallFullResidencyUsefulMacRatio += useful_ratio;
+    stats.smallFullResidencyPadWasteRatio += 1000ULL - useful_ratio;
+    if (static_cast<uint64_t>(
+            stats.smallFullResidencyLocalBufferPeak.value()) <
+        peak_local_bytes) {
+        stats.smallFullResidencyLocalBufferPeak = peak_local_bytes;
+    }
+
+    DPRINTF(MatrixFlowTiming,
+            "smallFullResidencyModeBegin: effectiveDim=%u paddedDim=%u "
+            "A=%#llx B=%#llx C=%#llx\n",
+            effective_dim, kSmallFullResidencyPadDim,
+            static_cast<unsigned long long>(ctx.baseA),
+            static_cast<unsigned long long>(ctx.baseB),
+            static_cast<unsigned long long>(ctx.baseC));
+    DPRINTF(MatrixFlowTiming,
+            "smallFullResidencyPad256: effectiveDim=%u paddedDim=%u "
+            "usefulMacRatioMilli=%llu padWasteRatioMilli=%llu\n",
+            effective_dim, kSmallFullResidencyPadDim,
+            static_cast<unsigned long long>(useful_ratio),
+            static_cast<unsigned long long>(1000ULL - useful_ratio));
+
+    issueSmallFullResidencyLoadA();
+}
+
+void
+MatrixFlowEngine::issueSmallFullResidencyLoadA()
+{
+    phase = Phase::FetchA;
+    smallFullResidencyLoadARow = 0;
+    auto *padded =
+        reinterpret_cast<uint32_t *>(smallFullResidencyAPaddedBuffer.data());
+    std::fill(padded,
+              padded + kSmallFullResidencyPadDim * kSmallFullResidencyPadDim,
+              0U);
+    DPRINTF(MatrixFlowTiming,
+            "smallFullResidencyLoadA: addr=%#llx bytes=%llu effectiveDim=%u\n",
+            static_cast<unsigned long long>(ctx.baseA),
+            static_cast<unsigned long long>(smallFullResidencyLoadABytes),
+            smallFullResidencyEffectiveDim);
+    stats.totalDmaBytesRead += smallFullResidencyLoadABytes;
+    issueSmallFullResidencyLoadARow();
+}
+
+void
+MatrixFlowEngine::issueSmallFullResidencyLoadARow()
+{
+    const Addr rowBytes = static_cast<Addr>(smallFullResidencyEffectiveDim) *
+        sizeof(uint32_t);
+    const Addr rowAddr = ctx.baseA +
+        static_cast<Addr>(smallFullResidencyLoadARow) * rowBytes;
+    auto *dst = smallFullResidencyAPaddedBuffer.data() +
+        static_cast<size_t>(smallFullResidencyLoadARow) *
+            kSmallFullResidencyPadDim * sizeof(uint32_t);
+    dmaPort.dmaAction(MemCmd::ReadReq, rowAddr, rowBytes,
+                      &smallFullResidencyLoadACompleteEvent, dst, 0);
+}
+
+void
+MatrixFlowEngine::onSmallFullResidencyLoadAComplete()
+{
+    smallFullResidencyLoadARow++;
+    if (smallFullResidencyLoadARow < smallFullResidencyEffectiveDim) {
+        issueSmallFullResidencyLoadARow();
+        return;
+    }
+    DPRINTF(MatrixFlowTiming,
+            "smallFullResidencyPadA: effectiveDim=%u paddedDim=%u\n",
+            smallFullResidencyEffectiveDim, kSmallFullResidencyPadDim);
+    issueSmallFullResidencyLoadB();
+}
+
+void
+MatrixFlowEngine::issueSmallFullResidencyLoadB()
+{
+    phase = Phase::FetchB;
+    smallFullResidencyLoadBRow = 0;
+    auto *padded =
+        reinterpret_cast<uint32_t *>(smallFullResidencyBPaddedBuffer.data());
+    auto *out =
+        reinterpret_cast<uint32_t *>(smallFullResidencyCPaddedBuffer.data());
+    std::fill(padded,
+              padded + kSmallFullResidencyPadDim * kSmallFullResidencyPadDim,
+              0U);
+    std::fill(out,
+              out + kSmallFullResidencyPadDim * kSmallFullResidencyPadDim,
+              0U);
+    DPRINTF(MatrixFlowTiming,
+            "smallFullResidencyLoadB: addr=%#llx bytes=%llu effectiveDim=%u\n",
+            static_cast<unsigned long long>(ctx.baseB),
+            static_cast<unsigned long long>(smallFullResidencyLoadBBytes),
+            smallFullResidencyEffectiveDim);
+    stats.totalDmaBytesRead += smallFullResidencyLoadBBytes;
+    issueSmallFullResidencyLoadBRow();
+}
+
+void
+MatrixFlowEngine::issueSmallFullResidencyLoadBRow()
+{
+    const Addr rowBytes = static_cast<Addr>(smallFullResidencyEffectiveDim) *
+        sizeof(uint32_t);
+    const Addr rowAddr = ctx.baseB +
+        static_cast<Addr>(smallFullResidencyLoadBRow) * rowBytes;
+    auto *dst = smallFullResidencyBPaddedBuffer.data() +
+        static_cast<size_t>(smallFullResidencyLoadBRow) *
+            kSmallFullResidencyPadDim * sizeof(uint32_t);
+    dmaPort.dmaAction(MemCmd::ReadReq, rowAddr, rowBytes,
+                      &smallFullResidencyLoadBCompleteEvent, dst, 0);
+}
+
+void
+MatrixFlowEngine::onSmallFullResidencyLoadBComplete()
+{
+    smallFullResidencyLoadBRow++;
+    if (smallFullResidencyLoadBRow < smallFullResidencyEffectiveDim) {
+        issueSmallFullResidencyLoadBRow();
+        return;
+    }
+    DPRINTF(MatrixFlowTiming,
+            "smallFullResidencyPadB: effectiveDim=%u paddedDim=%u\n",
+            smallFullResidencyEffectiveDim, kSmallFullResidencyPadDim);
+    launchSmallFullResidencyCompute();
+}
+
+void
+MatrixFlowEngine::launchSmallFullResidencyCompute()
+{
+    const uint64_t tile_cycles = estimateTileCycles(
+        kSmallFullResidencyPadDim, kSmallFullResidencyPadDim,
+        kSmallFullResidencyPadDim);
+    markBatchStepFirstWorkIssued();
+    phase = Phase::Compute;
+    smallFullResidencyComputeBeginTick = curTick();
+    DPRINTF(MatrixFlowTiming,
+            "smallFullResidencyComputeBegin: effectiveDim=%u paddedDim=%u "
+            "cycles=%llu\n",
+            smallFullResidencyEffectiveDim, kSmallFullResidencyPadDim,
+            static_cast<unsigned long long>(tile_cycles));
+    stats.totalComputeCycles += tile_cycles;
+    schedule(computeDoneEvent, curTick() + clockPeriod() * tile_cycles);
+}
+
+void
+MatrixFlowEngine::accumulateSmallFullResidencyCompute()
+{
+    auto *a =
+        reinterpret_cast<const uint32_t *>(
+            smallFullResidencyAPaddedBuffer.data());
+    auto *b =
+        reinterpret_cast<const uint32_t *>(
+            smallFullResidencyBPaddedBuffer.data());
+    auto *c =
+        reinterpret_cast<uint32_t *>(smallFullResidencyCPaddedBuffer.data());
+
+    for (uint32_t m = 0; m < smallFullResidencyEffectiveDim; ++m) {
+        for (uint32_t n = 0; n < smallFullResidencyEffectiveDim; ++n) {
+            uint64_t acc = 0;
+            for (uint32_t kk = 0; kk < kSmallFullResidencyPadDim; ++kk) {
+                acc += static_cast<uint64_t>(
+                    a[m * kSmallFullResidencyPadDim + kk]) *
+                    static_cast<uint64_t>(
+                        b[kk * kSmallFullResidencyPadDim + n]);
+            }
+            c[m * kSmallFullResidencyPadDim + n] = static_cast<uint32_t>(acc);
+        }
+    }
+    smallFullResidencyComputeEndTick = curTick();
+    finalUsefulWorkDoneTick = curTick();
+    markBatchStepLastWorkCompleted("small_full_residency_compute_done");
+    DPRINTF(MatrixFlowTiming,
+            "smallFullResidencyComputeEnd: effectiveDim=%u paddedDim=%u\n",
+            smallFullResidencyEffectiveDim, kSmallFullResidencyPadDim);
+    issueSmallFullResidencyWriteback();
+}
+
+void
+MatrixFlowEngine::issueSmallFullResidencyWriteback()
+{
+    phase = Phase::WriteC;
+    smallFullResidencyWritebackRow = 0;
+    smallFullResidencyWritebackBeginTick = curTick();
+    if (finalWritebackBeginTick == 0) {
+        finalWritebackBeginTick = curTick();
+    }
+    if (finalWritebackIssuedTick == 0) {
+        finalWritebackIssuedTick = curTick();
+    }
+    DPRINTF(MatrixFlowTiming,
+            "smallFullResidencyWritebackBegin: addr=%#llx bytes=%llu "
+            "effectiveDim=%u\n",
+            static_cast<unsigned long long>(ctx.baseC),
+            static_cast<unsigned long long>(smallFullResidencyWritebackBytes),
+            smallFullResidencyEffectiveDim);
+    DPRINTF(MatrixFlowTiming,
+            "smallFullResidencyWritebackEffectiveRegionOnly: rows=%u cols=%u "
+            "bytes=%llu\n",
+            smallFullResidencyEffectiveDim, smallFullResidencyEffectiveDim,
+            static_cast<unsigned long long>(smallFullResidencyWritebackBytes));
+    stats.totalDmaBytesWritten += smallFullResidencyWritebackBytes;
+    issueSmallFullResidencyWritebackRow();
+}
+
+void
+MatrixFlowEngine::issueSmallFullResidencyWritebackRow()
+{
+    const Addr rowBytes = static_cast<Addr>(smallFullResidencyEffectiveDim) *
+        sizeof(uint32_t);
+    const Addr rowAddr = ctx.baseC +
+        static_cast<Addr>(smallFullResidencyWritebackRow) * rowBytes;
+    auto *src = smallFullResidencyCPaddedBuffer.data() +
+        static_cast<size_t>(smallFullResidencyWritebackRow) *
+            kSmallFullResidencyPadDim * sizeof(uint32_t);
+    dmaPort.dmaAction(MemCmd::WriteReq, rowAddr, rowBytes,
+                      &smallFullResidencyWritebackCompleteEvent, src, 0);
+}
+
+void
+MatrixFlowEngine::onSmallFullResidencyWritebackComplete()
+{
+    smallFullResidencyWritebackRow++;
+    if (smallFullResidencyWritebackRow < smallFullResidencyEffectiveDim) {
+        issueSmallFullResidencyWritebackRow();
+        return;
+    }
+    smallFullResidencyWritebackEndTick = curTick();
+    finalWritebackAllResponsesDrainedTick = curTick();
+    completionEligibilitySatisfiedTick = curTick();
+    DPRINTF(MatrixFlowTiming,
+            "smallFullResidencyWritebackEnd: effectiveDim=%u bytes=%llu\n",
+            smallFullResidencyEffectiveDim,
+            static_cast<unsigned long long>(smallFullResidencyWritebackBytes));
+    issueWriteFlag();
 }
 
 bool
@@ -8796,10 +9232,16 @@ MatrixFlowEngine::onFetchDescComplete()
              "%s: descriptor ldc=%u < n=%u at %#llx\n",
              name(), ctx.ldc, ctx.nTotal,
              static_cast<unsigned long long>(pendingDescAddr));
-    const uint32_t cap = static_cast<uint32_t>(kMaxTileDim);
-    ctx.tileM = std::min(cap, ctx.mTotal);
-    ctx.tileN = std::min(cap, ctx.nTotal);
-    ctx.tileK = std::min(cap, ctx.kTotal);
+    if (logicalZeroFillClippedExecutionSupported()) {
+        ctx.tileM = std::min(static_cast<uint32_t>(kMaxTileDim), ctx.mTotal);
+        ctx.tileN = std::min(static_cast<uint32_t>(kMaxTileDim), ctx.nTotal);
+        ctx.tileK = std::min(static_cast<uint32_t>(kMaxTileDim), ctx.kTotal);
+    } else {
+        const uint32_t cap = static_cast<uint32_t>(kDefaultTileDim);
+        ctx.tileM = std::min(cap, ctx.mTotal);
+        ctx.tileN = std::min(cap, ctx.nTotal);
+        ctx.tileK = std::min(cap, ctx.kTotal);
+    }
     ctx.i = 0;
     ctx.j = 0;
     ctx.k = 0;
@@ -8869,14 +9311,22 @@ MatrixFlowEngine::onFetchDescComplete()
             !!(ctx.flags & kDescFlagIrregularSingleFusedDescriptorCornerCollapse),
             !!(ctx.flags & kDescFlagIrregularFinalCompletionChainAutopsy));
     DPRINTF(MatrixFlowTiming,
-            "boundaryOnlyHoldEarlyBodyWriteback=%d staticOutputTileClassifierBoundaryHold=%d boundaryWritebackCoalescing=%d streamingBodyWriteback=%d\n",
+            "boundaryOnlyHoldEarlyBodyWriteback=%d "
+            "staticOutputTileClassifierBoundaryHold=%d "
+            "boundaryWritebackCoalescing=%d "
+            "streamingBodyWriteback=%d "
+            "smallFullResidencyPad256=%d "
+            "logicalZeroFillClippedExecution=%d\n",
             !!(ctx.flags &
                kDescFlagIrregularBoundaryOnlyHoldEarlyBodyWriteback),
             !!(ctx.flags &
                kDescFlagIrregularStaticOutputTileClassifierBoundaryHold),
             !!(ctx.flags & kDescFlagIrregularBoundaryWritebackCoalescing),
-            !!(ctx.flags & kDescFlagIrregularStreamingBodyWriteback));
-    if (batchStepDescDecodedTicks[autopsyIdx] >= batchStepDescFetchedTicks[autopsyIdx]) {
+            !!(ctx.flags & kDescFlagIrregularStreamingBodyWriteback),
+            !!(ctx.flags & kDescFlagIrregularSmallFullResidencyPad256),
+            !!(ctx.flags & kDescFlagIrregularLogicalZeroFillClippedExecution));
+    if (batchStepDescDecodedTicks[autopsyIdx] >=
+        batchStepDescFetchedTicks[autopsyIdx]) {
         const Tick delta = batchStepDescDecodedTicks[autopsyIdx] -
                            batchStepDescFetchedTicks[autopsyIdx];
         stats.descriptorDecodeOverheadCycles += delta / clockPeriod();
@@ -8892,6 +9342,36 @@ MatrixFlowEngine::onFetchDescComplete()
             static_cast<unsigned long long>(ctx.baseA),
             static_cast<unsigned long long>(ctx.baseB),
             static_cast<unsigned long long>(ctx.baseC));
+    if (smallFullResidencySupported()) {
+        batchStepRunnableTicks[autopsyIdx] = curTick();
+        DPRINTF(MatrixFlowTiming,
+                "batchStepRunnable: index=%u tick=%llu\n",
+                autopsyIdx, static_cast<unsigned long long>(curTick()));
+        startSmallFullResidencyPath();
+        return;
+    }
+    if (logicalZeroFillClippedExecutionSupported()) {
+        const uint64_t useful_ratio =
+            (1000ULL * static_cast<uint64_t>(ctx.mTotal) * ctx.nTotal *
+             ctx.kTotal) /
+            (static_cast<uint64_t>(kSmallFullResidencyPadDim) *
+             kSmallFullResidencyPadDim * kSmallFullResidencyPadDim);
+        stats.logicalZeroFillModeCount++;
+        stats.logicalZeroFillValidM += ctx.mTotal;
+        stats.logicalZeroFillValidN += ctx.nTotal;
+        stats.logicalZeroFillValidK += ctx.kTotal;
+        stats.logicalZeroFillPadWasteRatio += 1000ULL - useful_ratio;
+        stats.effectiveUsefulMacRatio += useful_ratio;
+        DPRINTF(MatrixFlowTiming,
+                "logicalZeroFillModeBegin: dims=(%u,%u,%u) "
+                "tile=(%u,%u,%u) tick=%llu\n",
+                ctx.mTotal, ctx.nTotal, ctx.kTotal,
+                ctx.tileM, ctx.tileN, ctx.tileK,
+                static_cast<unsigned long long>(curTick()));
+        DPRINTF(MatrixFlowTiming,
+                "logicalZeroFillDescriptor validM=%u validN=%u validK=%u\n",
+                ctx.mTotal, ctx.nTotal, ctx.kTotal);
+    }
     if (irregularSingleFusedDescriptorCornerCollapseMode() &&
         batchSequenceActive && batchSubproblemIndex == 0) {
         stats.singleFusedIrregularDescriptorCount++;
@@ -9024,6 +9504,15 @@ MatrixFlowEngine::prepareOutputTile()
     ctx.curTileN = std::min(ctx.tileN, ctx.nTotal - ctx.j);
     ctx.curTileK = std::min(ctx.tileK, ctx.kTotal - ctx.k);
 
+    if (logicalZeroFillClippedExecutionSupported()) {
+        DPRINTF(MatrixFlowTiming,
+                "effectiveComputeSpan: tileBase=(%u,%u,%u) "
+                "validM=%u validN=%u validK=%u fullTile=(%u,%u,%u)\n",
+                ctx.i, ctx.j, ctx.k,
+                ctx.curTileM, ctx.curTileN, ctx.curTileK,
+                ctx.tileM, ctx.tileN, ctx.tileK);
+    }
+
     if (ctx.k == 0) {
         std::fill(tileCBuffer.begin(), tileCBuffer.end(), 0);
     }
@@ -9042,6 +9531,33 @@ MatrixFlowEngine::issueFetchATile()
     reqsIssuedA = 0;
     reqsCompletedA = 0;
     targetReqsA = ctx.curTileM;
+    if (logicalZeroFillClippedExecutionSupported()) {
+        const uint64_t effective_bytes =
+            static_cast<uint64_t>(ctx.curTileM) * ctx.curTileK *
+            ctx.elemBytes;
+        const uint64_t full_bytes =
+            static_cast<uint64_t>(ctx.tileM) * ctx.tileK * ctx.elemBytes;
+        stats.effectiveInputLoadBytes += effective_bytes;
+        if (full_bytes > effective_bytes) {
+            const uint64_t avoided = full_bytes - effective_bytes;
+            stats.zeroFillAppliedBytes += avoided;
+            stats.paddingInputBytesAvoided += avoided;
+        }
+        DPRINTF(MatrixFlowTiming,
+                "loadEffectiveA: tileBase=(%u,%u,%u) bytes=%llu validM=%u "
+                "validK=%u\n",
+                ctx.i, ctx.j, ctx.k,
+                static_cast<unsigned long long>(effective_bytes),
+                ctx.curTileM, ctx.curTileK);
+        DPRINTF(MatrixFlowTiming,
+                "zeroFillAppliedA: tileBase=(%u,%u,%u) paddedBytes=%llu "
+                "fullTileM=%u fullTileK=%u\n",
+                ctx.i, ctx.j, ctx.k,
+                static_cast<unsigned long long>(
+                    full_bytes > effective_bytes ? full_bytes - effective_bytes
+                                                : 0ULL),
+                ctx.tileM, ctx.tileK);
+    }
     std::fill(currentARowIssued.begin(), currentARowIssued.end(), false);
     aWaitedForBThisTile = false;
     bWaitedForAThisTile = false;
@@ -9234,6 +9750,33 @@ MatrixFlowEngine::issueFetchBTile()
     reqsIssuedB = prefetched_rows + inflight_rows;
     reqsCompletedB = prefetched_rows;
     targetReqsB = ctx.curTileK;
+    if (logicalZeroFillClippedExecutionSupported()) {
+        const uint64_t effective_bytes =
+            static_cast<uint64_t>(ctx.curTileK) * ctx.curTileN *
+            ctx.elemBytes;
+        const uint64_t full_bytes =
+            static_cast<uint64_t>(ctx.tileK) * ctx.tileN * ctx.elemBytes;
+        stats.effectiveInputLoadBytes += effective_bytes;
+        if (full_bytes > effective_bytes) {
+            const uint64_t avoided = full_bytes - effective_bytes;
+            stats.zeroFillAppliedBytes += avoided;
+            stats.paddingInputBytesAvoided += avoided;
+        }
+        DPRINTF(MatrixFlowTiming,
+                "loadEffectiveB: tileBase=(%u,%u,%u) bytes=%llu validK=%u "
+                "validN=%u\n",
+                ctx.i, ctx.j, ctx.k,
+                static_cast<unsigned long long>(effective_bytes),
+                ctx.curTileK, ctx.curTileN);
+        DPRINTF(MatrixFlowTiming,
+                "zeroFillAppliedB: tileBase=(%u,%u,%u) paddedBytes=%llu "
+                "fullTileK=%u fullTileN=%u\n",
+                ctx.i, ctx.j, ctx.k,
+                static_cast<unsigned long long>(
+                    full_bytes > effective_bytes ? full_bytes - effective_bytes
+                                                : 0ULL),
+                ctx.tileK, ctx.tileN);
+    }
     DPRINTF(MatrixFlowTiming,
             "fetchBTile: dims=(%u,%u,%u) tile=(%u,%u,%u) rowBytes=%llu "
             "targetRows=%u prefetched=%u inflight=%u\n",
@@ -10235,6 +10778,35 @@ MatrixFlowEngine::issueWriteCTile()
             static_cast<unsigned long long>(
                 static_cast<Addr>(ctx.curTileN) * ctx.elemBytes),
             ctx.curTileM, ctx.curTileN);
+    if (logicalZeroFillClippedExecutionSupported()) {
+        const uint64_t effective_bytes =
+            static_cast<uint64_t>(ctx.curTileM) * ctx.curTileN *
+            ctx.elemBytes;
+        const uint64_t full_bytes =
+            static_cast<uint64_t>(ctx.tileM) * ctx.tileN * ctx.elemBytes;
+        stats.effectiveWritebackBytes += effective_bytes;
+        if (full_bytes > effective_bytes) {
+            stats.paddingWritebackBytesAvoided += full_bytes - effective_bytes;
+        }
+        stats.effectiveRegionWritebackCount++;
+        DPRINTF(MatrixFlowTiming,
+                "effectiveRegionWritebackOnly: tileBase=(%u,%u,%u) rows=%u "
+                "cols=%u bytes=%llu\n",
+                ctx.i, ctx.j, ctx.k, ctx.curTileM, ctx.curTileN,
+                static_cast<unsigned long long>(effective_bytes));
+        DPRINTF(MatrixFlowTiming,
+                "effectiveRegionWritebackBytes: tileBase=(%u,%u,%u) "
+                "bytes=%llu\n",
+                ctx.i, ctx.j, ctx.k,
+                static_cast<unsigned long long>(effective_bytes));
+        DPRINTF(MatrixFlowTiming,
+                "paddingRegionWritebackSkipped: tileBase=(%u,%u,%u) "
+                "bytes=%llu\n",
+                ctx.i, ctx.j, ctx.k,
+                static_cast<unsigned long long>(
+                    full_bytes > effective_bytes ? full_bytes - effective_bytes
+                                                : 0ULL));
+    }
     if (writeCOverlapWindowActive) {
         stats.writeCOverlapEnabledCount++;
         serviceWriteCOverlap();
@@ -11315,6 +11887,8 @@ MatrixFlowEngine::launchComputeTile()
 
     const uint64_t tileCycles = estimateTileCycles(
         ctx.curTileM, ctx.curTileN, ctx.curTileK);
+    const uint64_t fullTileCycles = estimateTileCycles(
+        ctx.tileM, ctx.tileN, ctx.tileK);
     const char *kernelVariant =
         ctx.curTileM == 1 && ctx.curTileN == 1 ? "scalar_corner" :
         (ctx.curTileN == 1 ? "skinny_n_rect" :
@@ -11337,6 +11911,41 @@ MatrixFlowEngine::launchComputeTile()
             ctx.curTileM, ctx.curTileN, ctx.curTileK,
             kernelVariant, ctx.curTileN, ctx.curTileN,
             static_cast<unsigned long long>(tileCycles));
+    if (logicalZeroFillClippedExecutionSupported()) {
+        stats.effectiveComputeCycles += tileCycles;
+        stats.fullTileEquivalentCycles += fullTileCycles;
+        if (fullTileCycles > tileCycles) {
+            stats.computeCyclesAvoidedByClipping +=
+                fullTileCycles - tileCycles;
+        }
+        if (currentTileNeedsLogicalClipping()) {
+            const uint64_t full_microtiles =
+                divCeil(static_cast<uint64_t>(ctx.tileM), macArraySize) *
+                divCeil(static_cast<uint64_t>(ctx.tileN), macArraySize) *
+                divCeil(static_cast<uint64_t>(ctx.tileK), macArraySize);
+            const uint64_t effective_microtiles =
+                divCeil(static_cast<uint64_t>(ctx.curTileM), macArraySize) *
+                divCeil(static_cast<uint64_t>(ctx.curTileN), macArraySize) *
+                divCeil(static_cast<uint64_t>(ctx.curTileK), macArraySize);
+            stats.clippedExecutionCount++;
+            stats.clippedMicroTileCount += effective_microtiles;
+            DPRINTF(MatrixFlowTiming,
+                    "clippedTileExecution: tileBase=(%u,%u,%u) validM=%u "
+                    "validN=%u validK=%u fullTile=(%u,%u,%u) "
+                    "effectiveCycles=%llu fullTileEquivalentCycles=%llu\n",
+                    ctx.i, ctx.j, ctx.k,
+                    ctx.curTileM, ctx.curTileN, ctx.curTileK,
+                    ctx.tileM, ctx.tileN, ctx.tileK,
+                    static_cast<unsigned long long>(tileCycles),
+                    static_cast<unsigned long long>(fullTileCycles));
+            DPRINTF(MatrixFlowTiming,
+                    "clippedMicroTileExecution: tileBase=(%u,%u,%u) "
+                    "effectiveMicroTiles=%llu fullMicroTiles=%llu\n",
+                    ctx.i, ctx.j, ctx.k,
+                    static_cast<unsigned long long>(effective_microtiles),
+                    static_cast<unsigned long long>(full_microtiles));
+        }
+    }
     if (hierarchicalProtectedBSchedulerMode()) {
         warn("%s: hier-trace launchCompute i=%u j=%u k=%u "
              "readyA=%u/%u readyB=%u/%u winA=%u winB=%u cycles=%llu\n",
@@ -11387,6 +11996,13 @@ MatrixFlowEngine::advanceTile()
     if (ctx.i >= ctx.mTotal) {
         markBatchStepLastWorkCompleted("all_tiles_done");
         finalUsefulWorkDoneTick = curTick();
+        if (logicalZeroFillClippedExecutionSupported()) {
+            DPRINTF(MatrixFlowTiming,
+                    "completionIgnoresPaddingRegion: dims=(%u,%u,%u) "
+                    "tick=%llu\n",
+                    ctx.mTotal, ctx.nTotal, ctx.kTotal,
+                    static_cast<unsigned long long>(curTick()));
+        }
         DPRINTF(MatrixFlowTiming,
                 "finalUsefulWorkDone: index=%u tick=%llu\n",
                 batchSubproblemIndex,
@@ -11589,6 +12205,11 @@ MatrixFlowEngine::startMatrixCompute(
 void
 MatrixFlowEngine::processComputeDone()
 {
+    if (smallFullResidencyActive) {
+        accumulateSmallFullResidencyCompute();
+        return;
+    }
+
     if (!fullInputsReadyForAccumulate()) {
         if (claimBasedHoleFillingMode()) {
             expireCurrentFutureClaimsIfBlocked();
@@ -11917,6 +12538,18 @@ MatrixFlowEngine::onWriteFlagComplete()
             static_cast<unsigned long long>(subproblemDmaWrite),
             static_cast<unsigned long long>(subproblemComputeCycles));
     deviceCompletionFullyVisibleTick = curTick();
+    if (smallFullResidencyActive && smallFullResidencyBeginTick != 0 &&
+        curTick() >= smallFullResidencyBeginTick) {
+        stats.smallFullResidencyCompletionCycles +=
+            (curTick() - smallFullResidencyBeginTick) / clockPeriod();
+    }
+    if (logicalZeroFillClippedExecutionSupported()) {
+        DPRINTF(MatrixFlowTiming,
+                "phase1_device_done: validM=%u validN=%u "
+                "validK=%u tick=%llu\n",
+                ctx.mTotal, ctx.nTotal, ctx.kTotal,
+                static_cast<unsigned long long>(curTick()));
+    }
     DPRINTF(MatrixFlowTiming,
             "deviceCompletionFullyVisible: tick=%llu autopsyActive=%d flags=%#x\n",
             static_cast<unsigned long long>(

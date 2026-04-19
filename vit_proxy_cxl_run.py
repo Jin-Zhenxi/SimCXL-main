@@ -177,6 +177,18 @@ def parse_args() -> argparse.Namespace:
         dest="irregular_gemm_static_output_tile_classifier_boundary_hold_first_cut",
         action="store_true",
     )
+    parser.add_argument(
+        "--irregular-gemm-small-full-residency-pad256-first-cut",
+        "--irregular_gemm_small_full_residency_pad256_first_cut",
+        dest="irregular_gemm_small_full_residency_pad256_first_cut",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--irregular-gemm-logical-zero-fill-clipped-execution-first-cut",
+        "--irregular_gemm_logical_zero_fill_clipped_execution_first_cut",
+        dest="irregular_gemm_logical_zero_fill_clipped_execution_first_cut",
+        action="store_true",
+    )
     parser.add_argument("--skip-compile", action="store_true")
     parser.add_argument("--skip-inject", action="store_true")
     parser.add_argument("--keep-existing", action="store_true")
@@ -220,16 +232,35 @@ def main() -> None:
             args.irregular_gemm_static_output_tile_classifier_boundary_hold_first_cut
         ):
             print("   mode=static_classifier")
+        if args.irregular_gemm_small_full_residency_pad256_first_cut:
+            print("   mode=small_full_residency_pad256")
+        if args.irregular_gemm_logical_zero_fill_clipped_execution_first_cut:
+            print("   mode=logical_zero_fill")
         print("=" * 50)
 
         for preset in selected_presets:
             preset_tag = preset["name"].replace(" ", "_").replace("/", "_")
             seq_len = preset["seq_len"]
-            run_tag = f"{preset_tag}__{args.prefetch_label}__cxl_{args.device_link_gbs}g"
-            if (
-                args.irregular_gemm_static_output_tile_classifier_boundary_hold_first_cut
-            ):
+            static_classifier_mode = getattr(
+                args,
+                "irregular_gemm_static_output_tile_classifier_"
+                "boundary_hold_first_cut",
+            )
+            logical_zero_fill_mode = getattr(
+                args,
+                "irregular_gemm_logical_zero_fill_clipped_execution_"
+                "first_cut",
+            )
+            run_tag = (
+                f"{preset_tag}__{args.prefetch_label}__cxl_"
+                f"{args.device_link_gbs}g"
+            )
+            if static_classifier_mode:
                 run_tag += "__static_classifier"
+            if args.irregular_gemm_small_full_residency_pad256_first_cut:
+                run_tag += "__small_full_residency"
+            if logical_zero_fill_mode:
+                run_tag += "__logical_zero_fill"
             m5out_dir = OUTPUT_DIR / f"m5out_{run_tag}"
             log_file = OUTPUT_DIR / f"terminal_log_{run_tag}.txt"
             serial_log = m5out_dir / "board.pc.com_1.device"
@@ -255,6 +286,24 @@ def main() -> None:
             env = build_matrixflow_env(
                 os.environ.copy(), prefetch_cfg, preset["name"]
             )
+            optional_args = []
+            if static_classifier_mode:
+                optional_args.append(
+                    "--irregular-gemm-static-output-tile-classifier-"
+                    "boundary-hold-first-cut"
+                )
+            if args.irregular_gemm_small_full_residency_pad256_first_cut:
+                optional_args.append(
+                    "--irregular-gemm-small-full-residency-pad256-first-cut"
+                )
+            if logical_zero_fill_mode:
+                optional_args.append(
+                    "--irregular-gemm-logical-zero-fill-clipped-execution-"
+                    "first-cut"
+                )
+            optional_flags = ""
+            if optional_args:
+                optional_flags = " ".join(optional_args) + " "
             cmd = (
                 f"{GEM5_BIN} -p {GEM5_ROOT / 'src/python'} "
                 "--debug-flags=MatrixFlowTiming "
@@ -266,7 +315,7 @@ def main() -> None:
                 f"--matrixflow_size {seq_len} "
                 "--matrixflow_workload vit_proxy "
                 f"--device-link-gbs {args.device_link_gbs} "
-                f"{'--irregular-gemm-static-output-tile-classifier-boundary-hold-first-cut ' if args.irregular_gemm_static_output_tile_classifier_boundary_hold_first_cut else ''}"
+                f"{optional_flags}"
                 "--allow-local-trigger "
                 f"> {log_file} 2>&1"
             )
