@@ -203,11 +203,26 @@ def extract_phase_timings(log_file):
         "phase2_gelu_ms": 0.0,
         "phase2_residual_ms": 0.0,
         "phase2_h2d_ms": 0.0,
+        "phase2_copy_ms": 0.0,
         "phase2_non_gemm_ms": 0.0,
         "phase2_total_ms": 0.0,
         "phase3_ms": 0.0,
         "end_to_end_ms": 0.0,
+        "system_name": "unknown",
+        "GEMM_location": "unknown",
+        "NonGEMM_location": "unknown",
+        "data_home": "unknown",
+        "data_home_before_nongemm": "unknown",
         "host_mediated_copy_bytes": 0,
+        "phase2_cpu_reads_remote_mem_bytes": 0,
+        "phase2_cpu_writes_remote_mem_bytes": 0,
+        "remote_memory_cacheable": 0,
+        "remote_memory_coherent": 0,
+        "explicit_host_mediated_copy_used": 0,
+        "phase2_remote_first_pass_bytes": 0,
+        "phase2_remote_revisit_bytes": 0,
+        "phase2_remote_cache_hit_like_count": 0,
+        "phase2_remote_cache_miss_like_count": 0,
         "phase2_read_bytes": 0,
         "phase2_write_bytes": 0,
         "phase2_read_accesses": 0,
@@ -225,13 +240,30 @@ def extract_phase_timings(log_file):
         "phase2_gelu_ms",
         "phase2_residual_ms",
         "phase2_h2d_ms",
+        "phase2_copy_ms",
         "phase2_non_gemm_ms",
         "phase2_total_ms",
         "phase3_ms",
         "end_to_end_ms",
     ]
+    string_keys = [
+        "system_name",
+        "GEMM_location",
+        "NonGEMM_location",
+        "data_home",
+        "data_home_before_nongemm",
+    ]
     int_keys = [
         "host_mediated_copy_bytes",
+        "phase2_cpu_reads_remote_mem_bytes",
+        "phase2_cpu_writes_remote_mem_bytes",
+        "remote_memory_cacheable",
+        "remote_memory_coherent",
+        "explicit_host_mediated_copy_used",
+        "phase2_remote_first_pass_bytes",
+        "phase2_remote_revisit_bytes",
+        "phase2_remote_cache_hit_like_count",
+        "phase2_remote_cache_miss_like_count",
         "phase2_read_bytes",
         "phase2_write_bytes",
         "phase2_read_accesses",
@@ -247,6 +279,12 @@ def extract_phase_timings(log_file):
                 match = re.search(rf"\[Timing\] {re.escape(key)}=([0-9.]+)", line)
                 if match:
                     timings[key] = float(match.group(1))
+            for key in string_keys:
+                match = re.search(
+                    rf"\[Timing\] {re.escape(key)}=([A-Za-z0-9_]+)", line
+                )
+                if match:
+                    timings[key] = match.group(1)
             for key in int_keys:
                 match = re.search(rf"\[Timing\] {re.escape(key)}=(\d+)", line)
                 if match:

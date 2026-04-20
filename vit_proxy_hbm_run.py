@@ -61,6 +61,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-compile", action="store_true")
     parser.add_argument("--skip-inject", action="store_true")
     parser.add_argument("--keep-existing", action="store_true")
+    parser.add_argument(
+        "--phase2-mode",
+        "--phase2_mode",
+        dest="phase2_mode",
+        choices=[
+            "devm_copy",
+            "correct_devm_copy_good_path",
+            "devmem_5x_non_gemm_remote_access",
+        ],
+        default="devm_copy",
+    )
+    parser.add_argument(
+        "--only-preset",
+        choices=[preset["name"] for preset in PRESETS],
+        help="Run only one ViT preset for quick validation.",
+    )
     return parser.parse_args()
 
 
@@ -68,27 +84,41 @@ def main() -> None:
     args = parse_args()
     ensure_libm5()
     OUTPUT_DIR.mkdir(exist_ok=True)
+    if args.phase2_mode == "devm_copy":
+        summary_csv = SUMMARY_CSV
+        summary_txt = SUMMARY_TXT
+    else:
+        summary_csv = OUTPUT_DIR / f"hbm_vit_proxy_{args.phase2_mode}_data.csv"
+        summary_txt = OUTPUT_DIR / f"hbm_vit_proxy_{args.phase2_mode}_raw.txt"
 
     original_trigger = TRIGGER_SRC.read_text(encoding="utf-8")
     results: list[dict[str, object]] = []
 
     try:
         print("🚀 启动 HBM ViT proxy sweep")
+        selected_presets = [
+            preset for preset in PRESETS
+            if args.only_preset is None or preset["name"] == args.only_preset
+        ]
         print(
             "   预设: "
             + ", ".join(
                 f"{preset['name']}[S={preset['seq_len']},H={preset['hidden_dim']},"
                 f"M={preset['mlp_dim']},heads={preset['num_heads']}]"
-                for preset in PRESETS
+                for preset in selected_presets
             )
         )
         print(f"   device_link_gbs={args.device_link_gbs}")
+        print(f"   phase2_mode={args.phase2_mode}")
         print("=" * 50)
 
-        for preset in PRESETS:
+        for preset in selected_presets:
             preset_tag = preset["name"].replace(" ", "_").replace("/", "_")
             seq_len = preset["seq_len"]
-            run_tag = f"{preset_tag}__pcie_hbm_{args.device_link_gbs}g"
+            run_tag = (
+                f"{preset_tag}__pcie_hbm_{args.device_link_gbs}g__"
+                f"{args.phase2_mode}"
+            )
             m5out_dir = OUTPUT_DIR / f"m5out_{run_tag}"
             log_file = OUTPUT_DIR / f"terminal_log_{run_tag}.txt"
             serial_log = m5out_dir / "board.pc.com_1.device"
@@ -125,6 +155,7 @@ def main() -> None:
                 f"--matrixflow_size {seq_len} "
                 "--matrixflow_workload vit_proxy "
                 f"--device-link-gbs {args.device_link_gbs} "
+                f"--phase2-mode {args.phase2_mode} "
                 "--allow-local-trigger "
                 f"> {log_file} 2>&1"
             )
@@ -171,6 +202,13 @@ def main() -> None:
                 "NumHeads": preset["num_heads"],
                 "GEMM Proxy Size": seq_len,
                 "Phase2 Mode": phase_timings["phase2_mode"],
+                "system_name": phase_timings["system_name"],
+                "GEMM_location": phase_timings["GEMM_location"],
+                "NonGEMM_location": phase_timings["NonGEMM_location"],
+                "data_home": phase_timings["data_home"],
+                "data_home_before_nongemm": phase_timings[
+                    "data_home_before_nongemm"
+                ],
                 "FLOPs": int(flops),
                 "End-to-End ROI Latency (s)": round(roi_latency_s, 6),
                 "end_to_end_ms": round(phase_timings["end_to_end_ms"], 6),
@@ -187,6 +225,7 @@ def main() -> None:
                     phase_timings["phase2_residual_ms"], 6
                 ),
                 "phase2_h2d_ms": round(phase_timings["phase2_h2d_ms"], 6),
+                "phase2_copy_ms": round(phase_timings["phase2_copy_ms"], 6),
                 "phase2_non_gemm_ms": round(
                     phase_timings["phase2_non_gemm_ms"], 6
                 ),
@@ -202,6 +241,33 @@ def main() -> None:
                 ),
                 "host_mediated_copy_bytes": phase_timings[
                     "host_mediated_copy_bytes"
+                ],
+                "phase2_cpu_reads_remote_mem_bytes": phase_timings[
+                    "phase2_cpu_reads_remote_mem_bytes"
+                ],
+                "phase2_cpu_writes_remote_mem_bytes": phase_timings[
+                    "phase2_cpu_writes_remote_mem_bytes"
+                ],
+                "remote_memory_cacheable": phase_timings[
+                    "remote_memory_cacheable"
+                ],
+                "remote_memory_coherent": phase_timings[
+                    "remote_memory_coherent"
+                ],
+                "explicit_host_mediated_copy_used": phase_timings[
+                    "explicit_host_mediated_copy_used"
+                ],
+                "phase2_remote_first_pass_bytes": phase_timings[
+                    "phase2_remote_first_pass_bytes"
+                ],
+                "phase2_remote_revisit_bytes": phase_timings[
+                    "phase2_remote_revisit_bytes"
+                ],
+                "phase2_remote_cache_hit_like_count": phase_timings[
+                    "phase2_remote_cache_hit_like_count"
+                ],
+                "phase2_remote_cache_miss_like_count": phase_timings[
+                    "phase2_remote_cache_miss_like_count"
                 ],
                 "phase2_read_bytes": phase_timings["phase2_read_bytes"],
                 "phase2_write_bytes": phase_timings["phase2_write_bytes"],
@@ -257,17 +323,17 @@ def main() -> None:
 
     if results:
         headers = list(results[0].keys())
-        with SUMMARY_CSV.open("w", newline="", encoding="utf-8") as fh:
+        with summary_csv.open("w", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=headers)
             writer.writeheader()
             writer.writerows(results)
 
-        with SUMMARY_TXT.open("w", encoding="utf-8") as fh:
+        with summary_txt.open("w", encoding="utf-8") as fh:
             for row in results:
                 fh.write(str(row) + "\n")
 
         print("\n" + "=" * 50)
-        print(f"🎉 HBM ViT proxy 完成！数据已保存至: {SUMMARY_CSV}")
+        print(f"🎉 HBM ViT proxy 完成！数据已保存至: {summary_csv}")
 
 
 if __name__ == "__main__":

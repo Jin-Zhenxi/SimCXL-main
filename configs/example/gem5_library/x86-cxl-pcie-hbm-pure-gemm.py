@@ -117,6 +117,17 @@ parser.add_argument(
     choices=[16, 32, 64, 128, 256],
     default=64,
 )
+parser.add_argument(
+    "--phase2-mode",
+    "--phase2_mode",
+    dest="phase2_mode",
+    choices=[
+        "devm_copy",
+        "correct_devm_copy_good_path",
+        "devmem_5x_non_gemm_remote_access",
+    ],
+    default="devm_copy",
+)
 args = parser.parse_args()
 
 if args.no_network:
@@ -179,7 +190,8 @@ print(
     f"device_link_gbs={args.device_link_gbs}, "
     "fabric_clock=2GHz, "
     f"cxl_mem_bus_width={device_link_width_bytes(args.device_link_gbs)}B, "
-    f"workload={args.matrixflow_workload}"
+    f"workload={args.matrixflow_workload}, "
+    f"phase2_mode={args.phase2_mode}"
 )
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -188,7 +200,7 @@ kernel_path = os.path.join(simcxl_root, "vmlinux")
 disk_path = os.path.join(simcxl_root, "parsec.img")
 script_path = os.path.join(simcxl_root, "script.sh")
 
-trigger_extra_args = [str(args.device_link_gbs)]
+trigger_extra_args = [str(args.device_link_gbs), args.phase2_mode]
 
 command = build_matrixflow_command(
     manual=args.manual,

@@ -38,6 +38,22 @@ enum WorkloadMode {
     WORKLOAD_HOST_LINK_GEMM = 2,
 };
 
+enum Phase2Mode {
+    PHASE2_DEVM_COPY = 0,
+    PHASE2_DEVMEM_5X_NON_GEMM_REMOTE_ACCESS = 1,
+};
+
+struct RemoteAccessStats {
+    unsigned long long first_pass_bytes;
+    unsigned long long revisit_bytes;
+    unsigned long long read_bytes;
+    unsigned long long write_bytes;
+    unsigned long long read_accesses;
+    unsigned long long write_accesses;
+    unsigned long long cache_hit_like_count;
+    unsigned long long cache_miss_like_count;
+};
+
 static unsigned long long
 align_up_ull(unsigned long long value, unsigned long long align)
 {
@@ -156,6 +172,9 @@ validate_expected_result(const volatile uint32_t *matrix_C_cpu_ptr,
 static void
 refresh_device_buffer(const volatile void *ptr, size_t size);
 
+static float
+approx_gelu(float x);
+
 static int
 wait_for_expected_result(const volatile uint32_t *matrix_C_cpu_ptr,
                          size_t matrix_elems, uint32_t expected_value,
@@ -217,6 +236,110 @@ parse_workload_mode(const char *name)
         return WORKLOAD_HOST_LINK_GEMM;
     }
     return WORKLOAD_VIT_PROXY;
+}
+
+static enum Phase2Mode
+parse_phase2_mode(const char *name)
+{
+    if (name != NULL &&
+        strcmp(name, "devmem_5x_non_gemm_remote_access") == 0) {
+        return PHASE2_DEVMEM_5X_NON_GEMM_REMOTE_ACCESS;
+    }
+    return PHASE2_DEVM_COPY;
+}
+
+static uint32_t
+remote_read_u32(volatile uint32_t *ptr, struct RemoteAccessStats *stats,
+                int first_pass)
+{
+    uint32_t value;
+    _mm_clflush((const void *)ptr);
+    asm volatile("mfence" ::: "memory");
+    value = *ptr;
+    if (stats != NULL) {
+        stats->read_bytes += sizeof(uint32_t);
+        stats->read_accesses += 1;
+        stats->cache_miss_like_count += 1;
+        if (first_pass) {
+            stats->first_pass_bytes += sizeof(uint32_t);
+        } else {
+            stats->revisit_bytes += sizeof(uint32_t);
+        }
+    }
+    return value;
+}
+
+static void
+remote_write_u32(volatile uint32_t *ptr, uint32_t value,
+                 struct RemoteAccessStats *stats, int first_pass)
+{
+    *ptr = value;
+    _mm_clflush((const void *)ptr);
+    asm volatile("mfence" ::: "memory");
+    if (stats != NULL) {
+        stats->write_bytes += sizeof(uint32_t);
+        stats->write_accesses += 1;
+        stats->cache_miss_like_count += 1;
+        if (first_pass) {
+            stats->first_pass_bytes += sizeof(uint32_t);
+        } else {
+            stats->revisit_bytes += sizeof(uint32_t);
+        }
+    }
+}
+
+static void
+run_devmem_bad_path_phase2(volatile uint32_t *score_buf, uint32_t seq_len,
+                           struct RemoteAccessStats *stats)
+{
+    const unsigned revisit_passes = 4;
+    const size_t elems = (size_t)seq_len * (size_t)seq_len;
+
+    printf("nonGemmPath=devmem_5x_non_gemm_remote_access\n");
+    printf("cpuDirectRemoteAccessBegin\n");
+
+    for (uint32_t r = 0; r < seq_len; ++r) {
+        volatile uint32_t *row = score_buf + (size_t)r * seq_len;
+        uint32_t max_val = remote_read_u32(row, stats, 1);
+        for (uint32_t c = 1; c < seq_len; ++c) {
+            uint32_t value = remote_read_u32(row + c, stats, 1);
+            if (value > max_val) {
+                max_val = value;
+            }
+        }
+
+        uint64_t sum = 0;
+        for (uint32_t c = 0; c < seq_len; ++c) {
+            uint32_t value = remote_read_u32(row + c, stats, 0);
+            value = (uint32_t)((value + max_val + c + 1U) & 0xffffU);
+            sum += value + 1U;
+            remote_write_u32(row + c, value, stats, 0);
+        }
+
+        if (sum == 0) {
+            sum = 1;
+        }
+        for (uint32_t c = 0; c < seq_len; ++c) {
+            uint32_t value = remote_read_u32(row + c, stats, 0);
+            value = (uint32_t)((value * 1024ULL) / sum);
+            remote_write_u32(row + c, value, stats, 0);
+        }
+    }
+
+    for (unsigned pass = 0; pass < revisit_passes; ++pass) {
+        for (size_t i = 0; i < elems; ++i) {
+            uint32_t value = remote_read_u32(score_buf + i, stats, 0);
+            float x = (float)(value & 0xffffU) * 0.001f;
+            x = approx_gelu(x + (float)(pass + 1U) * 0.01f);
+            value = (uint32_t)(x * 1024.0f) ^ (uint32_t)(i + pass);
+            remote_write_u32(score_buf + i, value, stats, 0);
+        }
+    }
+
+    printf("cpuDirectRemoteAccessBytes=%llu\n",
+           stats != NULL ? stats->read_bytes + stats->write_bytes : 0ULL);
+    printf("cpuDirectRemoteAccessEnd\n");
+    printf("explicitHostCopyUsed=0\n");
 }
 
 static uint64_t
@@ -339,6 +462,7 @@ main(int argc, char *argv[])
     uint32_t default_mlp_dim = 5120;
     uint32_t default_num_heads = 16;
     const char *default_workload = "vit_proxy";
+    const char *phase2_mode_name = "devm_copy";
     uint32_t configured_host_link_gbs = 0;
     unsigned long long configured_host_link_window_base = 0;
 
@@ -350,9 +474,6 @@ main(int argc, char *argv[])
     }
     if (argc >= 5) {
         configured_host_link_gbs = (uint32_t)strtoul(argv[4], NULL, 0);
-    }
-    if (argc >= 6) {
-        configured_host_link_window_base = strtoull(argv[5], NULL, 0);
     }
 
     struct VitProxyConfig cfg = {
@@ -366,6 +487,16 @@ main(int argc, char *argv[])
     const int run_host_link_gemm = workload_mode == WORKLOAD_HOST_LINK_GEMM;
     const int run_phase2 = workload_mode == WORKLOAD_VIT_PROXY;
     const int run_phase3 = workload_mode == WORKLOAD_VIT_PROXY;
+    for (int argi = 5; argi < argc; ++argi) {
+        if (strcmp(argv[argi], "devm_copy") == 0 ||
+            strcmp(argv[argi], "correct_devm_copy_good_path") == 0 ||
+            strcmp(argv[argi], "devmem_5x_non_gemm_remote_access") == 0) {
+            phase2_mode_name = argv[argi];
+        } else if (run_host_link_gemm) {
+            configured_host_link_window_base = strtoull(argv[argi], NULL, 0);
+        }
+    }
+    enum Phase2Mode phase2_mode = parse_phase2_mode(phase2_mode_name);
     const char *workload_name = "vit_proxy";
     if (workload_mode == WORKLOAD_PURE_GEMM) {
         workload_name = "pure_gemm";
@@ -415,6 +546,7 @@ main(int argc, char *argv[])
         printf("[Config] matrix_size=%u x %u, configured_host_link=unknown\n",
                matrix_size, matrix_size);
     }
+    printf("[Config] phase2_mode=%s\n", phase2_mode_name);
 
     int ctl_fd = open("/dev/mem", O_RDWR | O_SYNC);
     if (ctl_fd < 0) {
@@ -770,63 +902,122 @@ main(int argc, char *argv[])
     unsigned long long phase2_remote_write_bytes = 0;
     unsigned long long phase2_remote_read_accesses = 0;
     unsigned long long phase2_remote_write_accesses = 0;
+    unsigned long long phase2_cpu_remote_read_bytes = 0;
+    unsigned long long phase2_cpu_remote_write_bytes = 0;
+    unsigned long long explicit_host_copy_bytes = 0;
+    int explicit_host_mediated_copy_used = 0;
+    int remote_memory_cacheable = 0;
+    int remote_memory_coherent = 0;
+    const char *system_name = "correct_devm_copy_good_path";
+    const char *data_home = "device_side_memory_with_host_shadow";
+    const char *data_home_before_nongemm = "device_side_memory";
+    struct RemoteAccessStats remote_stats = {0};
 
     if (run_phase2) {
         phase2_begin = now_ns();
-        printf("[Phase 2] host-side devm-copy + Non-GEMM proxy...\n");
-        phase2_remote_read_bytes = matrix_bytes;
-        phase2_remote_write_bytes = matrix_bytes;
-        phase2_remote_read_accesses = 1;
-        phase2_remote_write_accesses = 1;
+        if (phase2_mode == PHASE2_DEVMEM_5X_NON_GEMM_REMOTE_ACCESS) {
+            printf("[Phase 2] DevMem-style direct remote Non-GEMM bad path...\n");
+            system_name = "devmem_5x_non_gemm_remote_access";
+            data_home = "device_side_memory";
+            explicit_host_mediated_copy_used = 0;
+            remote_memory_cacheable = 0;
+            remote_memory_coherent = 0;
+            printf("system_name=devmem_5x_non_gemm_remote_access\n");
+            printf("GEMM_location=device_matrix_path\n");
+            printf("NonGEMM_location=CPU\n");
+            printf("data_home=device_side_memory\n");
+            printf("data_home_before_nongemm=device_side_memory\n");
+            printf("remoteMemoryCacheable=0\n");
+            printf("remoteMemoryCoherent=0\n");
+            printf("explicitHostCopyUsed=0\n");
+            softmax_begin = now_ns();
+            run_devmem_bad_path_phase2(matrix_C_cpu_ptr, cfg.seq_len,
+                                       &remote_stats);
+            softmax_end = now_ns();
+            phase2_remote_read_bytes = remote_stats.read_bytes;
+            phase2_remote_write_bytes = remote_stats.write_bytes;
+            phase2_remote_read_accesses = remote_stats.read_accesses;
+            phase2_remote_write_accesses = remote_stats.write_accesses;
+            phase2_cpu_remote_read_bytes = remote_stats.read_bytes;
+            phase2_cpu_remote_write_bytes = remote_stats.write_bytes;
+        } else {
+            printf("[Phase 2] correct devm-copy good path + Non-GEMM proxy...\n");
+            printf("nonGemmPath=correct_devm_copy_good_path\n");
+            printf("GEMM_location=device_matrix_path\n");
+            printf("NonGEMM_location=CPU\n");
+            printf("data_home_before_nongemm=device_side_memory\n");
+            printf("explicitHostMediatedCopyUsed=1\n");
+            system_name = "correct_devm_copy_good_path";
+            data_home = "device_side_memory_with_host_shadow";
+            data_home_before_nongemm = "device_side_memory";
+            explicit_host_mediated_copy_used = 1;
+            remote_memory_cacheable = 0;
+            remote_memory_coherent = 0;
+            phase2_remote_read_bytes = matrix_bytes;
+            phase2_remote_write_bytes = matrix_bytes;
+            phase2_remote_read_accesses = 1;
+            phase2_remote_write_accesses = 1;
+            explicit_host_copy_bytes =
+                phase2_remote_read_bytes + phase2_remote_write_bytes;
 
-        copy_d2h_begin = now_ns();
-        refresh_device_buffer(matrix_C_cpu_ptr, matrix_bytes);
-        memcpy(host_shadow_C, (const void *)matrix_C_cpu_ptr, matrix_bytes);
-        copy_d2h_end = now_ns();
+            printf("copyD2HBegin\n");
+            copy_d2h_begin = now_ns();
+            refresh_device_buffer(matrix_C_cpu_ptr, matrix_bytes);
+            memcpy(host_shadow_C, (const void *)matrix_C_cpu_ptr, matrix_bytes);
+            copy_d2h_end = now_ns();
+            printf("copyD2HEnd\n");
+            printf("copyD2HBytes=%llu\n", (unsigned long long)matrix_bytes);
 
-        for (size_t i = 0; i < matrix_elems; ++i) {
-            attn_scores[i] = (float)(host_shadow_C[i] & 0xffff) * 0.001f;
-        }
-
-        softmax_begin = now_ns();
-        softmax_rows(attn_scores, cfg.seq_len, cfg.seq_len);
-        softmax_end = now_ns();
-
-        populate_token_proxy(token_buf, attn_scores, token_elems, matrix_elems,
-                             cfg.hidden_dim, cfg.num_heads);
-        memcpy(residual_buf, token_buf, token_elems * sizeof(float));
-
-        layernorm_begin = now_ns();
-        layernorm_rows(token_buf, cfg.seq_len, cfg.hidden_dim);
-        layernorm_end = now_ns();
-
-        project_to_mlp(mlp_buf, token_buf, mlp_elems, token_elems);
-
-        gelu_begin = now_ns();
-        gelu_vector(mlp_buf, mlp_elems);
-        gelu_end = now_ns();
-
-        residual_begin = now_ns();
-        residual_add(token_buf, residual_buf, token_elems);
-        residual_end = now_ns();
-
-        for (size_t i = 0; i < matrix_elems; ++i) {
-            float combined = attn_scores[i] + token_buf[i % token_elems] +
-                             mlp_buf[i % mlp_elems];
-            if (combined < 0.0f) {
-                combined = 0.0f;
+            printf("nonGemmComputeOnHostBufferBegin\n");
+            for (size_t i = 0; i < matrix_elems; ++i) {
+                attn_scores[i] = (float)(host_shadow_C[i] & 0xffff) * 0.001f;
             }
-            host_shadow_C[i] = (uint32_t)(combined * 1024.0f);
-        }
 
-        copy_h2d_begin = now_ns();
-        memcpy((void *)matrix_C_cpu_ptr, host_shadow_C, matrix_bytes);
-        for (uintptr_t p = (uintptr_t)matrix_C_cpu_ptr;
-             p < (uintptr_t)matrix_C_cpu_ptr + matrix_bytes; p += 64) {
-            _mm_clflush((const void *)p);
+            softmax_begin = now_ns();
+            softmax_rows(attn_scores, cfg.seq_len, cfg.seq_len);
+            softmax_end = now_ns();
+
+            populate_token_proxy(token_buf, attn_scores, token_elems, matrix_elems,
+                                 cfg.hidden_dim, cfg.num_heads);
+            memcpy(residual_buf, token_buf, token_elems * sizeof(float));
+
+            layernorm_begin = now_ns();
+            layernorm_rows(token_buf, cfg.seq_len, cfg.hidden_dim);
+            layernorm_end = now_ns();
+
+            project_to_mlp(mlp_buf, token_buf, mlp_elems, token_elems);
+
+            gelu_begin = now_ns();
+            gelu_vector(mlp_buf, mlp_elems);
+            gelu_end = now_ns();
+
+            residual_begin = now_ns();
+            residual_add(token_buf, residual_buf, token_elems);
+            residual_end = now_ns();
+
+            for (size_t i = 0; i < matrix_elems; ++i) {
+                float combined = attn_scores[i] + token_buf[i % token_elems] +
+                                 mlp_buf[i % mlp_elems];
+                if (combined < 0.0f) {
+                    combined = 0.0f;
+                }
+                host_shadow_C[i] = (uint32_t)(combined * 1024.0f);
+            }
+            printf("nonGemmComputeOnHostBufferEnd\n");
+
+            printf("copyH2DBegin\n");
+            copy_h2d_begin = now_ns();
+            memcpy((void *)matrix_C_cpu_ptr, host_shadow_C, matrix_bytes);
+            for (uintptr_t p = (uintptr_t)matrix_C_cpu_ptr;
+                 p < (uintptr_t)matrix_C_cpu_ptr + matrix_bytes; p += 64) {
+                _mm_clflush((const void *)p);
+            }
+            asm volatile("mfence" ::: "memory");
+            copy_h2d_end = now_ns();
+            printf("copyH2DEnd\n");
+            printf("copyH2DBytes=%llu\n", (unsigned long long)matrix_bytes);
+            printf("explicitHostMediatedCopyUsed=1\n");
         }
-        asm volatile("mfence" ::: "memory");
-        copy_h2d_end = now_ns();
         phase2_end = now_ns();
         printf("[Phase 2] done\n");
     } else {
@@ -912,8 +1103,18 @@ main(int argc, char *argv[])
     printf("[Timing] preset=%s\n", cfg.preset_name);
     printf("[Timing] workload=%s\n", workload_name);
     printf("[Timing] phase2_mode=%s\n",
-           run_phase2 ? "devm_copy" :
+           run_phase2 ? phase2_mode_name :
            (run_host_link_gemm ? "host_link_gemm" : "none"));
+    printf("[Timing] system_name=%s\n", system_name);
+    printf("[Timing] GEMM_location=%s\n", "device_matrix_path");
+    printf("[Timing] NonGEMM_location=%s\n",
+           run_phase2 ? "CPU" : "none");
+    printf("[Timing] data_home=%s\n", data_home);
+    printf("[Timing] data_home_before_nongemm=%s\n", data_home_before_nongemm);
+    printf("[Timing] remote_memory_cacheable=%d\n", remote_memory_cacheable);
+    printf("[Timing] remote_memory_coherent=%d\n", remote_memory_coherent);
+    printf("[Timing] explicit_host_mediated_copy_used=%d\n",
+           explicit_host_mediated_copy_used);
     printf("[Timing] gemm_tile_count_per_gemm=%llu\n",
            (unsigned long long)tile_count_per_gemm);
     printf("[Timing] gemm_tile_count_total=%llu\n",
@@ -935,6 +1136,9 @@ main(int argc, char *argv[])
            (residual_end - residual_begin) / 1.0e6);
     printf("[Timing] phase2_h2d_ms=%.6f\n",
            (copy_h2d_end - copy_h2d_begin) / 1.0e6);
+    printf("[Timing] phase2_copy_ms=%.6f\n",
+           ((copy_d2h_end - copy_d2h_begin) +
+            (copy_h2d_end - copy_h2d_begin)) / 1.0e6);
     printf("[Timing] phase2_non_gemm_ms=%.6f\n",
            (softmax_end - softmax_begin +
             layernorm_end - layernorm_begin +
@@ -962,8 +1166,20 @@ main(int argc, char *argv[])
     printf("[Timing] host_link_read_accesses=%llu\n", host_link_read_accesses);
     printf("[Timing] host_link_write_accesses=%llu\n", host_link_write_accesses);
     printf("[Timing] host_mediated_copy_bytes=%llu\n",
-           phase2_remote_read_bytes + phase2_remote_write_bytes +
-           host_link_read_bytes + host_link_write_bytes);
+           explicit_host_copy_bytes + host_link_read_bytes +
+           host_link_write_bytes);
+    printf("[Timing] phase2_cpu_reads_remote_mem_bytes=%llu\n",
+           phase2_cpu_remote_read_bytes);
+    printf("[Timing] phase2_cpu_writes_remote_mem_bytes=%llu\n",
+           phase2_cpu_remote_write_bytes);
+    printf("[Timing] phase2_remote_first_pass_bytes=%llu\n",
+           remote_stats.first_pass_bytes);
+    printf("[Timing] phase2_remote_revisit_bytes=%llu\n",
+           remote_stats.revisit_bytes);
+    printf("[Timing] phase2_remote_cache_hit_like_count=%llu\n",
+           remote_stats.cache_hit_like_count);
+    printf("[Timing] phase2_remote_cache_miss_like_count=%llu\n",
+           remote_stats.cache_miss_like_count);
     printf("[Timing] phase2_read_bytes=%llu\n",
            phase2_remote_read_bytes + host_link_read_bytes);
     printf("[Timing] phase2_write_bytes=%llu\n",
